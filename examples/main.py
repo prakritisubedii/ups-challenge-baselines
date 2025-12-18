@@ -1,28 +1,7 @@
-from base import build_urls, decode_and_normalize_no_lang, collate_fn
 import torch
-from torch.utils.data import DataLoader
-import webdataset as wds
-from transformers import Wav2Vec2Config, Wav2Vec2ForPreTraining
-from transformers.models.wav2vec2.modeling_wav2vec2 import (
-    _compute_mask_indices,
-    _sample_negative_indices,
-)
 from transformers import AutoTokenizer, AutoFeatureExtractor, AutoModelForCTC
-from datasets import load_dataset
-import datasets
+from ups_challenge.dataloaders.base import build_wds_dataset, collate_fn
 import torch
-
-
-
-def build_wds_dataset(langs):
-    urls = build_urls(langs)
-    return (wds.WebDataset(
-        urls,
-        shardshuffle=False,
-    )
-    .to_tuple("mp3", "__key__", "__url__", handler=wds.handlers.ignore_and_continue)
-    .map(decode_and_normalize_no_lang)
-)
     
 if __name__ == "__main__":
     batch_size = 1

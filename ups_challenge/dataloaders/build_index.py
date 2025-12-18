@@ -1,26 +1,60 @@
 import json
 import os
 import pickle
+from pathlib import Path
 
-input_path = "ups_challenge/dataloaders/lang_id_results.jsonl" 
-output_path = "lid_index.pkl"
 
-index = {}
+def build_lid_index(index_path: str = "./data/lid_index.pkl", hf_token: str = None):
+    """
+    Build a language ID index from the JSONL results file.
+    The index maps (tar_number, filename) to predicted language.
+    Saves the index as a pickle file.
 
-with open(input_path, "r", encoding="utf-8") as f:
-    for line in f:
-        if not line.strip():
-            continue
-        obj = json.loads(line)
-        tar_number = obj["tar_number"]             
-        filename = os.path.basename(obj["filepath"])  
-        lang = obj["prediction"]                  
+    Args:
+        index_path (str): Path to save the index pickle file.
+    """
 
-        index[(tar_number, filename)] = lang
+    if hf_token is None:
+        hf_token = os.getenv("HF_TOKEN")
+    if hf_token is None:
+        raise ValueError("HF_TOKEN is not set")
 
-print(f"Built index with {len(index)} entries")
+    lid_folder = Path(index_path).parent
 
-with open(output_path, "wb") as f:
-    pickle.dump(index, f, protocol=4)
+    if not os.path.exists(lid_folder):
+        os.makedirs(lid_folder)
 
-print(f"Saved to {output_path}")
+    if not os.path.exists(lid_folder / "lang_id_results.jsonl"):
+        # Download the results file from Hugging Face
+        import requests
+
+        url = "https://huggingface.co/datasets/MLCommons/unsupervised_peoples_speech/resolve/main/lang_id_results.jsonl"
+        headers = {"Authorization": f"Bearer {hf_token}"}
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            raise ValueError(
+                f"Failed to download lid_results.jsonl: {response.status_code}"
+            )
+        with open(lid_folder / "lid_results.jsonl", "wb") as f:
+            f.write(response.content)
+        print(f"Downloaded lid_results.jsonl to {lid_folder / 'lid_results.jsonl'}")
+
+    index = {}
+
+    with open(lid_folder / "lang_id_results.jsonl", "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            tar_number = obj["tar_number"]
+            filename = os.path.basename(obj["filepath"])
+            lang = obj["prediction"]
+
+            index[(tar_number, filename)] = lang
+
+    print(f"Built index with {len(index)} entries")
+
+    with open(index_path, "wb") as f:
+        pickle.dump(index, f, protocol=4)
+
+    print(f"Saved to {index_path}")
