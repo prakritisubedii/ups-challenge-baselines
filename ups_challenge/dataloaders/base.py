@@ -49,12 +49,15 @@ def decode_and_normalize(
         output_chunks.append(chunk)
         batch_wave = torch.stack(output_chunks)
         attention_mask = torch.ones_like(batch_wave, dtype=torch.long)
+        num_chunks = batch_wave.shape[0]
         return {
-            "input_values": batch_wave,
-            "attention_mask": attention_mask,
-            "key": key,
-            "url": url,
+            "input_values": batch_wave,                 # [N_chunks, chunk_samples]
+            "attention_mask": attention_mask,           # same shape
+            "keys": [key] * num_chunks,                 # one key per chunk
+            "urls": [url] * num_chunks,                 # one url per chunk
         }
+
+
 
     # ---- 3) Choose random chunk start times (in seconds) ----
     max_start_sec = duration - chunk_sec
@@ -88,35 +91,36 @@ def decode_and_normalize(
 
     attention_mask = torch.ones_like(batch_wave, dtype=torch.long)
 
+    num_chunks = batch_wave.shape[0]
     return {
-        "input_values": batch_wave,  # [N_chunks, chunk_samples]
-        "attention_mask": attention_mask,  # same shape
+        "input_values": batch_wave,                 # [N_chunks, chunk_samples]
+        "attention_mask": attention_mask,           # same shape
+        "keys": [key] * num_chunks,                 # one key per chunk
+        "urls": [url] * num_chunks,                 # one url per chunk
     }
 
 
-def collate_fn(batch: list):
-    """
-    Custom collate function to:
-    - handle None samples
-    - concatenate input_values and attention_masks across the batch dimension
-    """
-    # Filter out any Nones that might slip through
-    batch = [b for b in batch if b is not None]
-    keys = [b["key"] for b in batch]
-    urls = [b["url"] for b in batch]
 
+def collate_fn(batch: list):
+    batch = [b for b in batch if b is not None]
     if len(batch) == 0:
         return None
 
     input_values = [b["input_values"] for b in batch]
-
     attention_masks = [b["attention_mask"] for b in batch]
+
+    # b["keys"] is already a list, so we flatten them
+    keys = [k for b in batch for k in b["keys"]]
+    urls = [u for b in batch for u in b["urls"]]
+
     return {
         "input_values": torch.cat(input_values, dim=0),
         "attention_mask": torch.cat(attention_masks, dim=0),
         "keys": keys,
         "urls": urls,
     }
+
+
 
 
 def build_wds_dataset(langs: list = [], index_path: str = "./data/lid_index.pkl"):
