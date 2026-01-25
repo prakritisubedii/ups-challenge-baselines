@@ -26,7 +26,7 @@ def decode_and_normalize(
 
     Any samples that fail to decode are logged and skipped.
     """
-    mp3_bytes, _, _ = sample
+    mp3_bytes, key, url = sample
     chunk_samples = int(chunk_sec * target_sr)
 
     output_chunks = []
@@ -50,8 +50,10 @@ def decode_and_normalize(
         batch_wave = torch.stack(output_chunks)
         attention_mask = torch.ones_like(batch_wave, dtype=torch.long)
         return {
-            "input_values": batch_wave,  # [N_chunks, chunk_samples]
-            "attention_mask": attention_mask,  # same shape
+            "input_values": batch_wave,
+            "attention_mask": attention_mask,
+            "key": key,
+            "url": url,
         }
 
     # ---- 3) Choose random chunk start times (in seconds) ----
@@ -100,6 +102,9 @@ def collate_fn(batch: list):
     """
     # Filter out any Nones that might slip through
     batch = [b for b in batch if b is not None]
+    keys = [b["key"] for b in batch]
+    urls = [b["url"] for b in batch]
+
     if len(batch) == 0:
         return None
 
@@ -107,8 +112,10 @@ def collate_fn(batch: list):
 
     attention_masks = [b["attention_mask"] for b in batch]
     return {
-        "input_values": torch.cat(input_values, dim=0),  # (sum_N_chunks, T)
+        "input_values": torch.cat(input_values, dim=0),
         "attention_mask": torch.cat(attention_masks, dim=0),
+        "keys": keys,
+        "urls": urls,
     }
 
 
