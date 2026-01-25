@@ -1,5 +1,6 @@
 import os
 import sys
+import soundfile as sf
 
 # Make sure Python can import from this repo
 REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -10,8 +11,7 @@ def main():
 
     from ups_challenge.dataloaders.base import build_wds_dataset, collate_fn
 
-    # Simple settings for a first test
-    batch_size = 2
+    batch_size = 2  # small is fine for testing
 
     # Build dataset (streaming)
     ds = build_wds_dataset()
@@ -25,26 +25,29 @@ def main():
     print("\n✅ Got one batch!")
     print("Batch type:", type(batch))
 
-    # Batch can be a dict or a tuple depending on the collate_fn
     if isinstance(batch, dict):
         print("Batch keys:", list(batch.keys()))
         for k, v in batch.items():
             try:
-                shape = tuple(v.shape)
-                print(f" - {k}: shape={shape}, dtype={getattr(v, 'dtype', type(v))}")
+                print(f" - {k}: shape={tuple(v.shape)}, dtype={v.dtype}")
             except Exception:
                 print(f" - {k}: type={type(v)}")
     else:
-        print("Batch contents (not a dict). Type:", type(batch))
-        try:
-            print("Length:", len(batch))
-            for i, item in enumerate(batch):
-                try:
-                    print(f" - item[{i}] shape={tuple(item.shape)} dtype={getattr(item, 'dtype', type(item))}")
-                except Exception:
-                    print(f" - item[{i}] type={type(item)}")
-        except Exception:
-            print("Could not get length. Batch is:", batch)
+        print("Batch is not a dict. Type:", type(batch))
+        return  # stop here, because below we assume dict format
+
+    # ---- Save the first audio sample so we can listen ----
+    x = batch["input_values"][0].cpu()
+
+    print("\nAudio stats (first sample):")
+    print(" - min:", float(x.min()))
+    print(" - max:", float(x.max()))
+    print(" - mean:", float(x.mean()))
+
+    out_path = "sample.wav"
+    sr = 16000
+    sf.write(out_path, x.numpy(), sr)
+    print("\nSaved:", out_path)
 
 if __name__ == "__main__":
     main()
