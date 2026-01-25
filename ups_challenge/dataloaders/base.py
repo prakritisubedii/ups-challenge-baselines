@@ -1,10 +1,11 @@
 import random
-
+import os
 import torch
 import webdataset as wds
 from torchcodec.decoders import AudioDecoder
 
 from .urls import build_urls
+from .vad_cache import load_cache, get_vad_segments_for_key
 
 
 def decode_and_normalize(
@@ -13,6 +14,8 @@ def decode_and_normalize(
     chunk_sec=10.0,
     max_chunks_per_example=16,
     shuffle_chunks=False,
+    use_vad= True,
+    vad_cache_path="./data/vad.cache.json",
 ):
     """
     sample comes from .to_tuple('mp3', '__key__', '__url__')
@@ -34,6 +37,13 @@ def decode_and_normalize(
     decoder = AudioDecoder(source=mp3_bytes, sample_rate=target_sr, num_channels=1)
 
     duration = decoder.metadata.duration_seconds_from_header
+    
+    # --- VAD lookup (speech regions) ---
+    hf_token = os.environ.get("HF_TOKEN")
+    vad_cache = load_cache(vad_cache_path) if use_vad else {}
+    vad_segments = []
+    if use_vad:
+        vad_segments = get_vad_segments_for_key(key, vad_cache, vad_cache_path, hf_token)
 
     # ---- 2) If short file, stream entire audio ----
     if duration <= chunk_sec:
@@ -62,10 +72,28 @@ def decode_and_normalize(
     # ---- 3) Choose random chunk start times (in seconds) ----
     max_start_sec = duration - chunk_sec
 
-    # Generate random starting times
-    start_times = [
-        random.uniform(0.0, max_start_sec) for _ in range(max_chunks_per_example)
-    ]
+    start_times = []
+
+    if use_vad and len(vad_segments) > 0:
+        # Pick chunk starts that overlap speech segments
+        for _ in range(max_chunks_per_example):
+            seg = random.choice(vad_segments)
+            seg_start = seg["start"] / target_sr
+            seg_end = seg["end"] / target_sr
+
+            # pick a random time inside the speech segment
+            t = random.uniform(seg_start, seg_end)
+
+            # choose chunk start so [start, start+chunk_sec] overlaps speech time t
+            start_sec = t - (chunk_sec / 2.0)
+            start_sec = max(0.0, min(start_sec, max_start_sec))
+            start_times.append(start_sec)
+    else:
+        # fallback: old behavior (random anywhere)
+        start_times = [
+            random.uniform(0.0, max_start_sec) for _ in range(max_chunks_per_example)
+        ]
+
 
     # ---- 4) Stream each chunk ----
     for start_sec in start_times:
