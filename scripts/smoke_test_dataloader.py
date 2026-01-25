@@ -1,7 +1,5 @@
 import os
 import sys
-import soundfile as sf
-import time
 
 # Make sure Python can import from this repo
 REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -12,49 +10,35 @@ def main():
 
     from ups_challenge.dataloaders.base import build_wds_dataset, collate_fn
 
-    num_samples_to_save = 10
-
-    # IMPORTANT:
-    # build_wds_dataset() returns multiple chunks per example (default up to 16)
-    # so "batch_size" here is number of source files, but output may be > 10 chunks.
-    batch_size = 2  # start small so we don't accidentally get 32+ chunks
+    # small batch for quick debugging
+    batch_size_files = 2
 
     ds = build_wds_dataset()
-    batched = ds.batched(batch_size, collation_fn=collate_fn)
+    batched = ds.batched(batch_size_files, collation_fn=collate_fn)
     batch = next(iter(batched))
 
     print("\n✅ Got one batch!")
     print("Batch keys:", list(batch.keys()))
     print("input_values shape:", tuple(batch["input_values"].shape))
+    print("attention_mask shape:", tuple(batch["attention_mask"].shape))
 
-    keys = batch.get("keys", None)
+    keys = batch.get("keys")
+    urls = batch.get("urls")
+
     if keys is not None:
         print("Number of keys:", len(keys))
         print("First 3 keys:", keys[:3])
+    else:
+        print("No keys found in batch.")
 
-    sr = 16000
+    if urls is not None:
+        print("First 1 url:", urls[0])
+    else:
+        print("No urls found in batch.")
 
-    out_dir = f"audio_samples_run_{int(time.time())}"
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Save min(num_samples_to_save, available_chunks)
-    n = min(num_samples_to_save, batch["input_values"].shape[0])
-
-    # Save a text file mapping wav -> key
-    map_path = os.path.join(out_dir, "mapping.txt")
-    with open(map_path, "w") as f:
-        for i in range(n):
-            x = batch["input_values"][i].cpu()
-            out_path = os.path.join(out_dir, f"sample_{i+1:02d}.wav")
-            sf.write(out_path, x.numpy(), sr)
-
-            k = keys[i] if keys is not None else "UNKNOWN_KEY"
-            f.write(f"sample_{i+1:02d}.wav\t{k}\n")
-
-            print("Saved:", out_path, "| key:", k)
-
-    print("\nSaved mapping file:", map_path)
-    print("Done. Saved", n, "audio files in:", out_dir)
+    # quick sanity check: how many unique source files in this batch?
+    if keys is not None:
+        print("Unique file keys in this batch:", len(set(keys)))
 
 if __name__ == "__main__":
     main()
