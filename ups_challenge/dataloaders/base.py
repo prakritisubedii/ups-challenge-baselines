@@ -11,9 +11,9 @@ from .urls import build_urls
 from .vad_cache import load_cache, get_vad_segments_for_key
 from .lid_cache import load_cache as load_lid_cache, get_lid_prediction_for_key
 
+
 # ---- Simple global cache so we don't reload the JSON on every sample ----
 _VAD_CACHE = None
-_LID_CACHE = None
 
 
 def _get_vad_cache(cache_path: str):
@@ -22,6 +22,7 @@ def _get_vad_cache(cache_path: str):
         _VAD_CACHE = load_cache(cache_path)
     return _VAD_CACHE
 
+_LID_CACHE = None
 
 def _get_lid_cache(cache_path: str):
     global _LID_CACHE
@@ -29,17 +30,16 @@ def _get_lid_cache(cache_path: str):
         _LID_CACHE = load_lid_cache(cache_path)
     return _LID_CACHE
 
-
 def decode_and_normalize(
     sample,
     target_sr=16000,
     chunk_sec=10.0,
     max_chunks_per_example=16,
     shuffle_chunks=False,
-    use_lid=True,
-    lid_cache_path="./data/lid_cache.json",
     use_vad=True,
     vad_cache_path="./data/vad_cache.json",
+    use_lid=True,
+    lid_cache_path="./data/lid_cache.json",
     # --- strict filtering knobs ---
     min_file_speech_ratio=0.25,      # skip files that are mostly non-speech
     require_full_speech_chunk=True,  # chunk must fit entirely inside a VAD speech segment
@@ -57,15 +57,11 @@ def decode_and_normalize(
           urls: list length N_chunks
     """
     mp3_bytes, key, url = sample
-    hf_token = os.environ.get("HF_TOKEN")
-
+        # --- LID check: skip files marked as "nospeech" ---
     if use_lid:
-        pred = get_lid_prediction_for_key(
-            key,
-            _get_lid_cache(lid_cache_path),
-            lid_cache_path,
-            hf_token,
-        )
+        hf_token = os.environ.get("HF_TOKEN")
+        lid_cache = _get_lid_cache(lid_cache_path)
+        pred = get_lid_prediction_for_key(key, lid_cache, lid_cache_path, hf_token)
         if pred == "nospeech":
             return None
 
@@ -81,6 +77,7 @@ def decode_and_normalize(
     # --- VAD lookup (speech regions) ---
     vad_segments = []
     if use_vad:
+        hf_token = os.environ.get("HF_TOKEN")
         vad_cache = _get_vad_cache(vad_cache_path)
         vad_segments = get_vad_segments_for_key(key, vad_cache, vad_cache_path, hf_token)
 
