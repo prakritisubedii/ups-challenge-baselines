@@ -12,6 +12,7 @@ import os
 import random
 import sys
 import time
+import warnings
 from dataclasses import asdict, dataclass
 
 import torch
@@ -44,6 +45,11 @@ def parse_args():
     parser.add_argument("--chunk_sec", type=float, default=10.0)
     parser.add_argument("--sr", type=int, default=16000)
     parser.add_argument("--out_dir", type=str, default=None)
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--prefetch_factor", type=int, default=2)
+    parser.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--persistent_workers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--suppress_warnings", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
@@ -190,10 +196,9 @@ def mask_mel(log_mel: torch.Tensor, mask_ratio: float):
     return masked, mask
 
 
-def build_batch(entries, batch_size, hf_token, vad_cache, args, max_tries=16):
-    waveforms = []
+def build_waveform_sample(entries, hf_token, vad_cache, args, max_tries=16):
     tries = 0
-    while len(waveforms) < batch_size and tries < max_tries:
+    while tries < max_tries:
         tries += 1
         entry = random.choice(entries)
         key = entry.get("vad_key")
@@ -222,17 +227,40 @@ def build_batch(entries, batch_size, hf_token, vad_cache, args, max_tries=16):
                 pad = expected - chunk.shape[-1]
                 chunk = torch.nn.functional.pad(chunk, (0, pad))
 
-            waveforms.append(chunk)
+            return chunk
         except Exception:
             continue
+    return None
 
-    if not waveforms:
-        return None
-    if len(waveforms) < batch_size:
-        return None
 
-    batch_wave = torch.stack(waveforms, dim=0)
-    return batch_wave
+class ManifestWaveformIterable(torch.utils.data.IterableDataset):
+    def __init__(self, entries, hf_token, vad_cache, args, max_tries=16):
+        super().__init__()
+        self.entries = entries
+        self.hf_token = hf_token
+        self.vad_cache = vad_cache
+        self.args = args
+        self.max_tries = max_tries
+
+    def __iter__(self):
+        while True:
+            sample = build_waveform_sample(
+                self.entries,
+                hf_token=self.hf_token,
+                vad_cache=self.vad_cache,
+                args=self.args,
+                max_tries=self.max_tries,
+            )
+            if sample is None:
+                continue
+            yield sample
+
+
+def collate_waveforms(samples):
+    samples = [s for s in samples if s is not None]
+    if not samples:
+        return None
+    return torch.stack(samples, dim=0)
 
 
 @dataclass
@@ -260,6 +288,8 @@ def save_checkpoint(out_dir, step, model, optimizer, args):
 
 def main():
     args = parse_args()
+    if args.suppress_warnings:
+        warnings.filterwarnings("ignore", category=FutureWarning)
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
     if args.out_dir is None:
@@ -282,24 +312,38 @@ def main():
     use_amp = device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
+    dataset = ManifestWaveformIterable(
+        entries,
+        hf_token=hf_token,
+        vad_cache=vad_cache,
+        args=args,
+        max_tries=max(16, args.batch_size * 4),
+    )
+    dataloader_kwargs = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "pin_memory": args.pin_memory,
+        "collate_fn": collate_waveforms,
+    }
+    if args.num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
+        dataloader_kwargs["persistent_workers"] = args.persistent_workers
+    loader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
+    loader_iter = iter(loader)
+
     losses = []
     start_time = time.time()
-
     for step in range(1, args.steps + 1):
-        batch_wave = build_batch(
-            entries,
-            batch_size=args.batch_size,
-            hf_token=hf_token,
-            vad_cache=vad_cache,
-            args=args,
-            max_tries=max(16, args.batch_size * 4),
-        )
+        t_step_start = time.time()
+        batch_wave = next(loader_iter)
+        t_after_data = time.time()
+
         if batch_wave is None:
             if step % args.log_every == 0:
                 print(f"Step {step}: skipped (no valid batch)")
             continue
 
-        batch_wave = batch_wave.to(device)
+        batch_wave = batch_wave.to(device, non_blocking=True)
         with torch.cuda.amp.autocast(enabled=use_amp):
             log_mel = waveform_to_log_mel(batch_wave, sr=args.sr)  # [B, 80, T]
             masked_mel, mask = mask_mel(log_mel, args.mask_ratio)
@@ -318,9 +362,16 @@ def main():
 
         loss_val = float(loss.detach().cpu().item())
         losses.append(loss_val)
+        t_after_compute = time.time()
 
         if step % args.log_every == 0:
-            print(f"Step {step}/{args.steps} - loss: {loss_val:.6f}")
+            time_data = t_after_data - t_step_start
+            time_compute = t_after_compute - t_after_data
+            step_time = t_after_compute - t_step_start
+            print(
+                f"Step {step}/{args.steps} - loss: {loss_val:.6f} | "
+                f"time_data: {time_data:.3f}s time_compute: {time_compute:.3f}s step_time: {step_time:.3f}s"
+            )
 
         if step % args.save_every == 0:
             save_checkpoint(args.out_dir, step, model, optimizer, args)
