@@ -141,32 +141,21 @@ def create_mel_filterbank(sr: int, n_fft: int, n_mels: int, f_min: float = 0.0, 
 
 def waveform_to_log_mel(waveform: torch.Tensor, sr: int, n_fft: int = 400, hop_length: int = 160, n_mels: int = 80):
     # waveform: [B, T]
-    try:
-        import torchaudio
-
-        mel = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sr,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            n_mels=n_mels,
-            power=2.0,
-        )(waveform)
-        log_mel = torch.log(mel + 1e-6)
-        return log_mel
-    except Exception:
-        stft = torch.stft(
-            waveform,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            win_length=n_fft,
-            window=torch.hann_window(n_fft),
-            return_complex=True,
-        )
-        power = stft.abs() ** 2
-        fb = create_mel_filterbank(sr=sr, n_fft=n_fft, n_mels=n_mels).to(power.device)
-        mel = torch.matmul(fb, power)
-        log_mel = torch.log(mel + 1e-6)
-        return log_mel
+    waveform = waveform.float()
+    device = waveform.device
+    stft = torch.stft(
+        waveform,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=n_fft,
+        window=torch.hann_window(n_fft, device=device),
+        return_complex=True,
+    )
+    power = stft.abs() ** 2
+    fb = create_mel_filterbank(sr=sr, n_fft=n_fft, n_mels=n_mels).to(device)
+    mel = torch.matmul(fb, power)
+    log_mel = torch.log(mel + 1e-6)
+    return log_mel
 
 
 class TinyConvAutoencoder(torch.nn.Module):
