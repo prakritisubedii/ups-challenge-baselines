@@ -12,10 +12,20 @@ def main():
 
     # small batch for quick debugging
     batch_size_files = 2
+    max_batches = 2600  # ~5200 samples if nothing is filtered; adjust as needed
 
     ds = build_wds_dataset()
     batched = ds.batched(batch_size_files, collation_fn=collate_fn)
-    batch = next(iter(batched))
+    batch = None
+    for i, b in enumerate(batched, start=1):
+        batch = b
+        if i % 200 == 0:
+            print(f"Processed {i} batches...")
+        if i >= max_batches:
+            break
+
+    if batch is None:
+        raise RuntimeError("No batch was produced by the dataloader.")
 
     print("\n✅ Got one batch!")
     print("Batch keys:", list(batch.keys()))
