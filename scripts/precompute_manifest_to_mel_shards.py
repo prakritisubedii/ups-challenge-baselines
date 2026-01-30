@@ -11,13 +11,11 @@ Output:
 import argparse
 import concurrent.futures as futures
 import glob
-import importlib.machinery
 import json
 import math
 import os
 import sys
 import time
-import types
 
 import torch
 import webdataset as wds
@@ -63,15 +61,7 @@ def load_manifest_entries(manifest_path: str) -> tuple[list[dict], int]:
     return entries, line_count
 
 
-def load_smoke_test_helpers():
-    script_path = os.path.join(REPO_ROOT, "scripts", "smoke_test_manifest_to_mel.py")
-    loader = importlib.machinery.SourceFileLoader("smoke_test_manifest_to_mel", script_path)
-    module = types.ModuleType(loader.name)
-    loader.exec_module(module)
-    return module
-
-
-SMOKE = load_smoke_test_helpers()
+from ups_challenge.audio_precompute import tar_url_for_number, fetch_mp3_bytes, waveform_to_log_mel
 
 
 def fetch_mp3_bytes_from_url(url: str, key: str):
@@ -117,7 +107,7 @@ def process_entry(
     if url:
         mp3_bytes = fetch_mp3_bytes_from_url(url, key)
     elif tar_number is not None:
-        mp3_bytes = SMOKE.fetch_mp3_bytes(int(tar_number), key, hf_token)
+        mp3_bytes = fetch_mp3_bytes(int(tar_number), key, hf_token)
     else:
         raise ValueError("Missing tar_number and url")
 
@@ -150,9 +140,7 @@ def process_entry(
             chunk = torch.nn.functional.pad(chunk, (0, pad))
 
         waveform = chunk.unsqueeze(0)
-        log_mel = SMOKE.waveform_to_log_mel(
-            waveform, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels
-        )
+        log_mel = waveform_to_log_mel(waveform, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels)
         mel = log_mel.squeeze(0).float().cpu()
 
         out = {
