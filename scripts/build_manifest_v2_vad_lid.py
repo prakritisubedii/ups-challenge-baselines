@@ -37,9 +37,112 @@ def load_manifest_rows(manifest_path: str):
     return rows
 
 
-def load_lid_map(lid_json_path: str):
-    with open(lid_json_path, "r") as f:
-        return json.load(f)
+def normalize_lid_key(value: str) -> str:
+    if not isinstance(value, str):
+        return ""
+    if value.startswith("/data/"):
+        value = value[len("/data/") :]
+    if value.endswith(".mp3"):
+        value = value[: -len(".mp3")]
+    if "/" in value:
+        value = value.split("/")[-1]
+    return value
+
+
+def extract_key_from_entry(entry: dict) -> str:
+    for field in ("key", "vad_key", "id", "uid", "filepath", "path", "audio_filepath", "audio_path", "audio", "file"):
+        if field in entry:
+            return normalize_lid_key(entry.get(field))
+    return ""
+
+
+def extract_lang_from_entry(entry: dict):
+    for field in ("prediction", "lang", "language"):
+        if field in entry:
+            val = entry.get(field)
+            if isinstance(val, dict):
+                return val.get("label") or val.get("lang") or val.get("language")
+            return val
+    return None
+
+
+def load_lid_map(lid_json_path: str, print_every: int = 1_000_000):
+    lid_map = {}
+    _, ext = os.path.splitext(lid_json_path)
+    try:
+        print_every = int(os.environ.get("LID_PRINT_EVERY", print_every))
+    except ValueError:
+        print_every = 1_000_000
+
+    def _add_entry(key: str, lang) -> None:
+        if not key or lang is None:
+            return
+        lid_map[key] = str(lang).lower().strip()
+
+    if ext.lower() == ".jsonl":
+        with open(lid_json_path, "r", encoding="utf-8") as f:
+            line_count = 0
+            for line in f:
+                if not line.strip():
+                    continue
+                line_count += 1
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                key = extract_key_from_entry(obj)
+                lang = extract_lang_from_entry(obj)
+                _add_entry(key, lang)
+                if line_count % print_every == 0:
+                    print(f"LID loaded lines: {line_count} | entries: {len(lid_map)}")
+        return lid_map
+
+    try:
+        with open(lid_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        data = None
+        with open(lid_json_path, "r", encoding="utf-8") as f:
+            line_count = 0
+            for line in f:
+                if not line.strip():
+                    continue
+                line_count += 1
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                key = extract_key_from_entry(obj)
+                lang = extract_lang_from_entry(obj)
+                _add_entry(key, lang)
+                if line_count % print_every == 0:
+                    print(f"LID loaded lines: {line_count} | entries: {len(lid_map)}")
+        return lid_map
+
+    if isinstance(data, dict):
+        for raw_key, value in data.items():
+            key = normalize_lid_key(raw_key)
+            if isinstance(value, dict):
+                lang = extract_lang_from_entry(value)
+            else:
+                lang = value
+            _add_entry(key, lang)
+        return lid_map
+
+    if isinstance(data, list):
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            key = extract_key_from_entry(entry)
+            lang = extract_lang_from_entry(entry)
+            _add_entry(key, lang)
+        return lid_map
+
+    return lid_map
 
 
 def main():
@@ -70,7 +173,7 @@ def main():
     en_rows = []
 
     for row in rows:
-        key = row.get("vad_key")
+        key = normalize_lid_key(row.get("vad_key"))
         if not key:
             stats["dropped_missing_lid"] += 1
             continue
