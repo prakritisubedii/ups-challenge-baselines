@@ -11,10 +11,13 @@ Output:
 import argparse
 import concurrent.futures as futures
 import glob
+import importlib.machinery
 import json
+import math
 import os
 import sys
 import time
+import types
 
 import torch
 import webdataset as wds
@@ -25,6 +28,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, REPO_ROOT)
 
 SAMPLE_RATE_DEFAULT = 16000
+_PROCESSED_CHUNK_IDS: set[str] | None = None
 
 
 def parse_args():
@@ -35,6 +39,7 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_examples", type=int, default=-1)
     parser.add_argument("--resume", type=int, default=1)
+    parser.add_argument("--chunk_sec", type=float, default=2.0)
     parser.add_argument("--sr", type=int, default=16000)
     parser.add_argument("--n_mels", type=int, default=80)
     parser.add_argument("--n_fft", type=int, default=400)
@@ -58,17 +63,15 @@ def load_manifest_entries(manifest_path: str) -> tuple[list[dict], int]:
     return entries, line_count
 
 
-def tar_url_for_number(tar_number: str, hf_token: str | None):
-    tar_number = str(tar_number).zfill(6)
-    if int(tar_number) <= 5000:
-        base = "https://huggingface.co/datasets/MLCommons/unsupervised_peoples_speech/resolve/main/audio"
-    else:
-        base = "https://huggingface.co/datasets/MLCommons/unsupervised_peoples_speech/resolve/main/audio2"
-    url = f"{base}/{tar_number}.tar?download=True"
-    if hf_token is None:
-        raise ValueError("HF_TOKEN is not set")
-    token_header = f"Authorization:Bearer {hf_token}"
-    return f"pipe:curl -s -L {url} -H {token_header}"
+def load_smoke_test_helpers():
+    script_path = os.path.join(REPO_ROOT, "scripts", "smoke_test_manifest_to_mel.py")
+    loader = importlib.machinery.SourceFileLoader("smoke_test_manifest_to_mel", script_path)
+    module = types.ModuleType(loader.name)
+    loader.exec_module(module)
+    return module
+
+
+SMOKE = load_smoke_test_helpers()
 
 
 def fetch_mp3_bytes_from_url(url: str, key: str):
@@ -82,71 +85,6 @@ def fetch_mp3_bytes_from_url(url: str, key: str):
     return None
 
 
-def fetch_mp3_bytes(tar_number: int, key: str, hf_token: str | None):
-    url = tar_url_for_number(str(tar_number), hf_token)
-    return fetch_mp3_bytes_from_url(url, key)
-
-
-def create_mel_filterbank(sr: int, n_fft: int, n_mels: int, f_min: float = 0.0, f_max: float | None = None):
-    if f_max is None:
-        f_max = sr / 2.0
-
-    def hz_to_mel(freq_hz):
-        return 2595.0 * torch.log10(torch.tensor(1.0) + freq_hz / 700.0)
-
-    def mel_to_hz(mel):
-        return 700.0 * (10 ** (mel / 2595.0) - 1.0)
-
-    m_min = hz_to_mel(torch.tensor(f_min))
-    m_max = hz_to_mel(torch.tensor(f_max))
-    m_points = torch.linspace(m_min, m_max, n_mels + 2)
-    hz_points = mel_to_hz(m_points)
-    bin_freqs = torch.floor((n_fft + 1) * hz_points / sr).long()
-
-    fb = torch.zeros(n_mels, n_fft // 2 + 1)
-    for i in range(n_mels):
-        left = bin_freqs[i].item()
-        center = bin_freqs[i + 1].item()
-        right = bin_freqs[i + 2].item()
-        if center == left or right == center:
-            continue
-        for j in range(left, center):
-            fb[i, j] = (j - left) / (center - left)
-        for j in range(center, right):
-            fb[i, j] = (right - j) / (right - center)
-    return fb
-
-
-def waveform_to_log_mel(waveform: torch.Tensor, sr: int, n_fft: int = 400, hop_length: int = 160, n_mels: int = 80):
-    # waveform: [B, T]
-    try:
-        import torchaudio
-
-        mel = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sr,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            n_mels=n_mels,
-            power=2.0,
-        )(waveform)
-        log_mel = torch.log(mel + 1e-6)
-        return log_mel
-    except Exception:
-        stft = torch.stft(
-            waveform,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            win_length=n_fft,
-            window=torch.hann_window(n_fft),
-            return_complex=True,
-        )
-        power = stft.abs() ** 2
-        fb = create_mel_filterbank(sr=sr, n_fft=n_fft, n_mels=n_mels).to(power.device)
-        mel = torch.matmul(fb, power)
-        log_mel = torch.log(mel + 1e-6)
-        return log_mel
-
-
 def get_value(row: dict, keys: list[str], default=None):
     for k in keys:
         if k in row:
@@ -154,38 +92,23 @@ def get_value(row: dict, keys: list[str], default=None):
     return default
 
 
-def build_chunk_id(row: dict) -> str:
-    chunk_id = get_value(row, ["chunk_id", "id", "uid"])
-    if chunk_id:
-        return str(chunk_id)
-    key = get_value(row, ["key", "vad_key", "__key__"])
-    start_sec = get_value(row, ["start_sec", "start"])
-    end_sec = get_value(row, ["end_sec", "end"])
-    if key is None or start_sec is None or end_sec is None:
-        return ""
-    return f"{key}_{start_sec}_{end_sec}"
+def build_chunk_id(key: str, tar_number: int | None, chunk_index: int) -> str:
+    tar_label = "na" if tar_number is None else str(tar_number)
+    return f"{key}__t{tar_label}__i{chunk_index}"
 
 
-def extract_segment_seconds(row: dict):
-    start_sec = get_value(row, ["start_sec", "start"])
-    end_sec = get_value(row, ["end_sec", "end"])
-    if start_sec is None or end_sec is None:
-        return None, None
-    return float(start_sec), float(end_sec)
-
-
-def process_entry(entry: dict, sr: int, n_fft: int, hop_length: int, n_mels: int, hf_token: str | None) -> dict | None:
-    key = get_value(entry, ["key", "vad_key", "__key__"])
+def process_entry(
+    entry: dict,
+    sr: int,
+    n_fft: int,
+    hop_length: int,
+    n_mels: int,
+    hf_token: str | None,
+    chunk_sec: float,
+) -> list[dict]:
+    key = get_value(entry, ["vad_key", "key", "__key__"])
     if key is None:
-        raise ValueError("Missing key/vad_key")
-
-    chunk_id = build_chunk_id(entry)
-    if not chunk_id:
-        raise ValueError("Missing chunk_id and cannot derive from key/start/end")
-
-    start_sec, end_sec = extract_segment_seconds(entry)
-    if start_sec is None or end_sec is None:
-        raise ValueError("Missing start/end seconds")
+        raise ValueError("Missing vad_key")
 
     url = get_value(entry, ["url", "tar_url"])
     tar_number = get_value(entry, ["tar_number"])
@@ -194,7 +117,9 @@ def process_entry(entry: dict, sr: int, n_fft: int, hop_length: int, n_mels: int
     if url:
         mp3_bytes = fetch_mp3_bytes_from_url(url, key)
     elif tar_number is not None:
-        mp3_bytes = fetch_mp3_bytes(int(tar_number), key, hf_token)
+        mp3_bytes = SMOKE.fetch_mp3_bytes(int(tar_number), key, hf_token)
+    else:
+        raise ValueError("Missing tar_number and url")
 
     if mp3_bytes is None:
         raise ValueError("Failed to fetch mp3 bytes")
@@ -204,30 +129,50 @@ def process_entry(entry: dict, sr: int, n_fft: int, hop_length: int, n_mels: int
     if duration is None or duration <= 0:
         raise ValueError("Invalid duration")
 
-    start_sec = max(0.0, min(start_sec, duration))
-    end_sec = max(start_sec, min(end_sec, duration))
-
-    samples = decoder.get_samples_played_in_range(start_sec, end_sec)
-    chunk = samples.data.squeeze(0)
-
-    waveform = chunk.unsqueeze(0)
-    log_mel = waveform_to_log_mel(waveform, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels)
-    mel = log_mel.squeeze(0).float().cpu()
-
-    out = {
-        "chunk_id": chunk_id,
-        "key": key,
-        "start_sec": float(start_sec),
-        "end_sec": float(end_sec),
-        "sr": int(sr),
-        "mel": mel,
-    }
-    if url:
-        out["url"] = url
+    chunk_count = max(1, int(math.ceil(duration / chunk_sec)))
+    expected = int(chunk_sec * sr)
     lid = get_value(entry, ["lid", "lang"])
-    if lid is not None:
-        out["lid"] = lid
-    return out
+    results = []
+
+    for idx in range(chunk_count):
+        start_sec = idx * chunk_sec
+        end_sec = min(start_sec + chunk_sec, duration)
+        chunk_id = build_chunk_id(str(key), tar_number if tar_number is not None else None, idx)
+
+        if _PROCESSED_CHUNK_IDS and chunk_id in _PROCESSED_CHUNK_IDS:
+            continue
+
+        samples = decoder.get_samples_played_in_range(start_sec, end_sec)
+        chunk = samples.data.squeeze(0)
+
+        if chunk.shape[-1] < expected:
+            pad = expected - chunk.shape[-1]
+            chunk = torch.nn.functional.pad(chunk, (0, pad))
+
+        waveform = chunk.unsqueeze(0)
+        log_mel = SMOKE.waveform_to_log_mel(
+            waveform, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels
+        )
+        mel = log_mel.squeeze(0).float().cpu()
+
+        out = {
+            "chunk_id": chunk_id,
+            "key": key,
+            "start_sec": float(start_sec),
+            "end_sec": float(end_sec),
+            "sr": int(sr),
+            "mel": mel,
+        }
+        if url:
+            out["url"] = url
+        if lid is not None:
+            out["lid"] = lid
+        if tar_number is not None:
+            out["tar_number"] = int(tar_number)
+
+        results.append(out)
+
+    return results
 
 
 def load_processed_chunk_ids(features_path: str) -> set[str]:
@@ -260,6 +205,11 @@ def next_shard_index(shards_dir: str) -> int:
         return len(existing)
 
 
+def _init_worker(processed_chunk_ids: set[str]):
+    global _PROCESSED_CHUNK_IDS
+    _PROCESSED_CHUNK_IDS = processed_chunk_ids
+
+
 def main():
     args = parse_args()
     hf_token = os.environ.get("HF_TOKEN")
@@ -275,20 +225,18 @@ def main():
     features_path = os.path.join(args.out_dir, "manifest_features.jsonl")
     processed = load_processed_chunk_ids(features_path) if args.resume else set()
 
-    filtered = []
+    entries_to_process = []
     for entry in entries:
-        chunk_id = build_chunk_id(entry)
-        if not chunk_id:
+        key = get_value(entry, ["vad_key", "key", "__key__"])
+        if key is None:
             continue
-        if chunk_id in processed:
-            continue
-        filtered.append(entry)
+        entries_to_process.append(entry)
 
     if args.max_examples > 0:
-        filtered = filtered[: args.max_examples]
+        entries_to_process = entries_to_process[: args.max_examples]
 
     processed_count = len(processed)
-    remaining_count = len(filtered)
+    remaining_count = len(entries_to_process)
 
     print(f"manifest_path: {args.manifest_path}", flush=True)
     print(f"out_dir: {args.out_dir}", flush=True)
@@ -298,26 +246,23 @@ def main():
     print(f"processed_chunk_ids_loaded: {processed_count}", flush=True)
     print(f"remaining_to_process: {remaining_count}", flush=True)
 
-    if remaining_count == 0:
-        if processed_count > 0:
-            print("No new entries to process.", flush=True)
-            return
-        raise ValueError("No remaining entries to process after filtering.")
-
     shard_idx = next_shard_index(shards_dir)
     current_shard = []
     processed_count = 0
     skipped_count = len(processed)
     error_count = 0
+    chunk_total = 0
 
     start_time = time.time()
     print(
-        f"Processing {len(filtered)} entries with {args.num_workers} workers "
+        f"Processing {len(entries_to_process)} entries with {args.num_workers} workers "
         f"(resume={bool(args.resume)}, skipped={skipped_count})",
         flush=True,
     )
 
-    with futures.ProcessPoolExecutor(max_workers=args.num_workers) as executor:
+    with futures.ProcessPoolExecutor(
+        max_workers=args.num_workers, initializer=_init_worker, initargs=(processed,)
+    ) as executor:
         future_to_entry = {
             executor.submit(
                 process_entry,
@@ -327,53 +272,58 @@ def main():
                 args.hop_length,
                 args.n_mels,
                 hf_token,
+                args.chunk_sec,
             ): entry
-            for entry in filtered
+            for entry in entries_to_process
         }
 
         for idx, future in enumerate(futures.as_completed(future_to_entry), start=1):
             try:
-                result = future.result()
+                results = future.result()
             except Exception:
-                result = None
+                results = None
                 error_count += 1
 
-            if result is None:
+            if not results:
                 continue
 
-            current_shard.append(result)
-            processed_count += 1
+            for result in results:
+                chunk_total += 1
+                current_shard.append(result)
+                processed_count += 1
 
-            meta = {
-                "chunk_id": result["chunk_id"],
-                "key": result["key"],
-                "start_sec": result["start_sec"],
-                "end_sec": result["end_sec"],
-                "sr": result["sr"],
-            }
-            if "url" in result:
-                meta["url"] = result["url"]
-            if "lid" in result:
-                meta["lid"] = result["lid"]
+                meta = {
+                    "chunk_id": result["chunk_id"],
+                    "key": result["key"],
+                    "start_sec": result["start_sec"],
+                    "end_sec": result["end_sec"],
+                    "sr": result["sr"],
+                }
+                if "url" in result:
+                    meta["url"] = result["url"]
+                if "lid" in result:
+                    meta["lid"] = result["lid"]
+                if "tar_number" in result:
+                    meta["tar_number"] = result["tar_number"]
 
-            with open(features_path, "a") as f:
-                f.write(json.dumps(meta) + "\n")
+                with open(features_path, "a") as f:
+                    f.write(json.dumps(meta) + "\n")
 
-            if len(current_shard) >= args.examples_per_shard:
-                shard_path = os.path.join(shards_dir, f"shard-{shard_idx:05d}.pt")
-                torch.save(current_shard, shard_path)
-                print(
-                    f"Wrote {len(current_shard)} examples to {shard_path} "
-                    f"(processed={processed_count}, errors={error_count})",
-                    flush=True,
-                )
-                shard_idx += 1
-                current_shard = []
+                if len(current_shard) >= args.examples_per_shard:
+                    shard_path = os.path.join(shards_dir, f"shard-{shard_idx:05d}.pt")
+                    torch.save(current_shard, shard_path)
+                    print(
+                        f"Wrote {len(current_shard)} examples to {shard_path} "
+                        f"(processed={processed_count}, errors={error_count})",
+                        flush=True,
+                    )
+                    shard_idx += 1
+                    current_shard = []
 
             if idx % 200 == 0:
                 elapsed = time.time() - start_time
                 print(
-                    f"Progress: {idx}/{len(filtered)} futures | "
+                    f"Progress: {idx}/{len(entries_to_process)} futures | "
                     f"processed={processed_count} errors={error_count} elapsed_sec={elapsed:.1f}",
                     flush=True,
                 )
@@ -394,6 +344,7 @@ def main():
         "skipped_existing": skipped_count,
         "errors": error_count,
         "elapsed_sec": elapsed,
+        "chunks_emitted": chunk_total,
     }
     stats_path = os.path.join(args.out_dir, "stats.json")
     with open(stats_path, "w") as f:
