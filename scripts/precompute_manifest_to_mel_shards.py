@@ -42,18 +42,20 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_manifest_entries(manifest_path: str) -> list[dict]:
+def load_manifest_entries(manifest_path: str) -> tuple[list[dict], int]:
     entries = []
+    line_count = 0
     with open(manifest_path, "r") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
+            line_count += 1
             try:
                 entries.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    return entries
+    return entries, line_count
 
 
 def tar_url_for_number(tar_number: str, hf_token: str | None):
@@ -266,7 +268,7 @@ def main():
     shards_dir = os.path.join(args.out_dir, "shards")
     os.makedirs(shards_dir, exist_ok=True)
 
-    entries = load_manifest_entries(args.manifest_path)
+    entries, line_count = load_manifest_entries(args.manifest_path)
     if not entries:
         raise ValueError(f"No entries found in {args.manifest_path}")
 
@@ -285,9 +287,22 @@ def main():
     if args.max_examples > 0:
         filtered = filtered[: args.max_examples]
 
-    if not filtered:
-        print("No new entries to process.", flush=True)
-        return
+    processed_count = len(processed)
+    remaining_count = len(filtered)
+
+    print(f"manifest_path: {args.manifest_path}", flush=True)
+    print(f"out_dir: {args.out_dir}", flush=True)
+    print(f"manifest_exists: {os.path.exists(args.manifest_path)}", flush=True)
+    print(f"manifest_lines_read: {line_count}", flush=True)
+    print(f"resume_enabled: {bool(args.resume)}", flush=True)
+    print(f"processed_chunk_ids_loaded: {processed_count}", flush=True)
+    print(f"remaining_to_process: {remaining_count}", flush=True)
+
+    if remaining_count == 0:
+        if processed_count > 0:
+            print("No new entries to process.", flush=True)
+            return
+        raise ValueError("No remaining entries to process after filtering.")
 
     shard_idx = next_shard_index(shards_dir)
     current_shard = []
