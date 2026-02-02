@@ -87,6 +87,21 @@ def build_chunk_id(key: str, tar_number: int | None, chunk_index: int) -> str:
     return f"{key}__t{tar_label}__i{chunk_index}"
 
 
+def _get_segment_bounds(entry: dict):
+    start = get_value(entry, ["start_sec", "start"])
+    end = get_value(entry, ["end_sec", "end"])
+    if start is None or end is None:
+        return None
+    try:
+        start_f = float(start)
+        end_f = float(end)
+    except (TypeError, ValueError):
+        return None
+    if end_f <= start_f:
+        return None
+    return start_f, end_f
+
+
 def process_entry(
     entry: dict,
     sr: int,
@@ -114,15 +129,57 @@ def process_entry(
     if mp3_bytes is None:
         raise ValueError("Failed to fetch mp3 bytes")
 
+    lid = get_value(entry, ["lid", "lang"])
+    results = []
+
     decoder = AudioDecoder(source=mp3_bytes, sample_rate=sr, num_channels=1)
+    segment_bounds = _get_segment_bounds(entry)
+    if segment_bounds is not None:
+        start_sec, end_sec = segment_bounds
+        expected = int(round((end_sec - start_sec) * sr))
+        if expected <= 0:
+            raise ValueError("Invalid segment duration")
+        chunk_id = entry.get("chunk_id") or f"{key}__{start_sec:.3f}__{end_sec:.3f}"
+
+        if _PROCESSED_CHUNK_IDS and chunk_id in _PROCESSED_CHUNK_IDS:
+            return []
+
+        samples = decoder.get_samples_played_in_range(start_sec, end_sec)
+        chunk = samples.data.squeeze(0)
+
+        if chunk.shape[-1] < expected:
+            pad = expected - chunk.shape[-1]
+            chunk = torch.nn.functional.pad(chunk, (0, pad))
+        elif chunk.shape[-1] > expected:
+            chunk = chunk[..., :expected]
+
+        waveform = chunk.unsqueeze(0)
+        log_mel = waveform_to_log_mel(waveform, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels)
+        mel = log_mel.squeeze(0).float().cpu()
+
+        out = {
+            "chunk_id": chunk_id,
+            "key": key,
+            "start_sec": float(start_sec),
+            "end_sec": float(end_sec),
+            "sr": int(sr),
+            "mel": mel,
+        }
+        if url:
+            out["url"] = url
+        if lid is not None:
+            out["lid"] = lid
+        if tar_number is not None:
+            out["tar_number"] = int(tar_number)
+
+        return [out]
+
     duration = decoder.metadata.duration_seconds_from_header
     if duration is None or duration <= 0:
         raise ValueError("Invalid duration")
 
     chunk_count = max(1, int(math.ceil(duration / chunk_sec)))
     expected = int(chunk_sec * sr)
-    lid = get_value(entry, ["lid", "lang"])
-    results = []
 
     for idx in range(chunk_count):
         start_sec = idx * chunk_sec
@@ -220,19 +277,19 @@ def main():
             continue
         entries_to_process.append(entry)
 
-    if args.max_examples > 0:
-        entries_to_process = entries_to_process[: args.max_examples]
-
-    processed_count = len(processed)
     remaining_count = len(entries_to_process)
+    processed_loaded = len(processed)
 
     print(f"manifest_path: {args.manifest_path}", flush=True)
     print(f"out_dir: {args.out_dir}", flush=True)
     print(f"manifest_exists: {os.path.exists(args.manifest_path)}", flush=True)
     print(f"manifest_lines_read: {line_count}", flush=True)
     print(f"resume_enabled: {bool(args.resume)}", flush=True)
-    print(f"processed_chunk_ids_loaded: {processed_count}", flush=True)
+    print(f"processed_chunk_ids_loaded: {processed_loaded}", flush=True)
     print(f"remaining_to_process: {remaining_count}", flush=True)
+    sample_entry = entries_to_process[0] if entries_to_process else None
+    segment_mode = bool(sample_entry and _get_segment_bounds(sample_entry))
+    print(f"segment_mode_detected: {segment_mode}", flush=True)
 
     shard_idx = next_shard_index(shards_dir)
     current_shard = []
@@ -248,6 +305,7 @@ def main():
         flush=True,
     )
 
+    early_stop = False
     with futures.ProcessPoolExecutor(
         max_workers=args.num_workers, initializer=_init_worker, initargs=(processed,)
     ) as executor:
@@ -307,6 +365,16 @@ def main():
                     )
                     shard_idx += 1
                     current_shard = []
+
+                if args.max_examples > 0 and processed_count >= args.max_examples:
+                    early_stop = True
+                    break
+
+            if early_stop:
+                for fut in future_to_entry:
+                    if not fut.done():
+                        fut.cancel()
+                break
 
             if idx % 200 == 0:
                 elapsed = time.time() - start_time
