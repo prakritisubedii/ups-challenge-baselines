@@ -16,6 +16,7 @@ import math
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import webdataset as wds
@@ -42,6 +43,9 @@ def parse_args():
     parser.add_argument("--n_mels", type=int, default=80)
     parser.add_argument("--n_fft", type=int, default=400)
     parser.add_argument("--hop_length", type=int, default=160)
+    parser.add_argument("--timeout_sec", type=float, default=25.0)
+    parser.add_argument("--print_every", type=int, default=25)
+    parser.add_argument("--write_stats_every", type=int, default=200)
     return parser.parse_args()
 
 
@@ -73,6 +77,12 @@ def fetch_mp3_bytes_from_url(url: str, key: str):
         if sample_key == key:
             return mp3_bytes
     return None
+
+
+def run_with_timeout(fn, timeout_sec: float):
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(fn)
+        return future.result(timeout=timeout_sec)
 
 
 def get_value(row: dict, keys: list[str], default=None):
@@ -110,6 +120,7 @@ def process_entry(
     n_mels: int,
     hf_token: str | None,
     chunk_sec: float,
+    timeout_sec: float,
 ) -> list[dict]:
     key = get_value(entry, ["vad_key", "key", "__key__"])
     if key is None:
@@ -120,9 +131,11 @@ def process_entry(
 
     mp3_bytes = None
     if url:
-        mp3_bytes = fetch_mp3_bytes_from_url(url, key)
+        mp3_bytes = run_with_timeout(lambda: fetch_mp3_bytes_from_url(url, key), timeout_sec)
     elif tar_number is not None:
-        mp3_bytes = fetch_mp3_bytes(int(tar_number), key, hf_token)
+        mp3_bytes = run_with_timeout(
+            lambda: fetch_mp3_bytes(int(tar_number), key, hf_token), timeout_sec
+        )
     else:
         raise ValueError("Missing tar_number and url")
 
@@ -132,7 +145,6 @@ def process_entry(
     lid = get_value(entry, ["lid", "lang"])
     results = []
 
-    decoder = AudioDecoder(source=mp3_bytes, sample_rate=sr, num_channels=1)
     segment_bounds = _get_segment_bounds(entry)
     if segment_bounds is not None:
         start_sec, end_sec = segment_bounds
@@ -144,7 +156,11 @@ def process_entry(
         if _PROCESSED_CHUNK_IDS and chunk_id in _PROCESSED_CHUNK_IDS:
             return []
 
-        samples = decoder.get_samples_played_in_range(start_sec, end_sec)
+        def _decode_segment():
+            decoder = AudioDecoder(source=mp3_bytes, sample_rate=sr, num_channels=1)
+            return decoder.get_samples_played_in_range(start_sec, end_sec)
+
+        samples = run_with_timeout(_decode_segment, timeout_sec)
         chunk = samples.data.squeeze(0)
 
         if chunk.shape[-1] < expected:
@@ -174,7 +190,11 @@ def process_entry(
 
         return [out]
 
-    duration = decoder.metadata.duration_seconds_from_header
+    def _get_duration():
+        decoder = AudioDecoder(source=mp3_bytes, sample_rate=sr, num_channels=1)
+        return decoder.metadata.duration_seconds_from_header
+
+    duration = run_with_timeout(_get_duration, timeout_sec)
     if duration is None or duration <= 0:
         raise ValueError("Invalid duration")
 
@@ -189,7 +209,11 @@ def process_entry(
         if _PROCESSED_CHUNK_IDS and chunk_id in _PROCESSED_CHUNK_IDS:
             continue
 
-        samples = decoder.get_samples_played_in_range(start_sec, end_sec)
+        def _decode_chunk():
+            decoder = AudioDecoder(source=mp3_bytes, sample_rate=sr, num_channels=1)
+            return decoder.get_samples_played_in_range(start_sec, end_sec)
+
+        samples = run_with_timeout(_decode_chunk, timeout_sec)
         chunk = samples.data.squeeze(0)
 
         if chunk.shape[-1] < expected:
@@ -269,6 +293,7 @@ def main():
 
     features_path = os.path.join(args.out_dir, "manifest_features.jsonl")
     processed = load_processed_chunk_ids(features_path) if args.resume else set()
+    errors_path = os.path.join(args.out_dir, "errors.jsonl")
 
     entries_to_process = []
     for entry in entries:
@@ -290,13 +315,17 @@ def main():
     sample_entry = entries_to_process[0] if entries_to_process else None
     segment_mode = bool(sample_entry and _get_segment_bounds(sample_entry))
     print(f"segment_mode_detected: {segment_mode}", flush=True)
+    print(f"timeout_sec: {args.timeout_sec}", flush=True)
 
     shard_idx = next_shard_index(shards_dir)
-    current_shard = []
+    buffer = []
     processed_count = 0
     skipped_count = len(processed)
     error_count = 0
     chunk_total = 0
+    attempted = 0
+    last_chunk_id = None
+    last_tar_number = None
 
     start_time = time.time()
     print(
@@ -304,6 +333,44 @@ def main():
         f"(resume={bool(args.resume)}, skipped={skipped_count})",
         flush=True,
     )
+
+    def _log_error(meta: dict, error_type: str, error_msg: str):
+        err = {
+            "chunk_id": meta.get("chunk_id"),
+            "key": meta.get("key"),
+            "tar_number": meta.get("tar_number"),
+            "start_sec": meta.get("start_sec"),
+            "end_sec": meta.get("end_sec"),
+            "lid": meta.get("lid"),
+            "error_type": error_type,
+            "error_msg": error_msg,
+        }
+        with open(errors_path, "a") as f:
+            f.write(json.dumps(err) + "\n")
+
+    def _flush_buffer():
+        nonlocal buffer, shard_idx
+        while len(buffer) >= args.examples_per_shard:
+            shard_path = os.path.join(shards_dir, f"shard-{shard_idx:05d}.pt")
+            torch.save(buffer[: args.examples_per_shard], shard_path)
+            print(
+                f"Wrote {args.examples_per_shard} examples to {shard_path} "
+                f"(processed={processed_count}, errors={error_count})",
+                flush=True,
+            )
+            buffer = buffer[args.examples_per_shard :]
+            shard_idx += 1
+
+    def _write_partial_stats():
+        stats_partial = {
+            "attempted": attempted,
+            "ok_count": processed_count,
+            "error_count": error_count,
+            "last_chunk_id": last_chunk_id,
+        }
+        stats_partial_path = os.path.join(args.out_dir, "stats_partial.json")
+        with open(stats_partial_path, "w") as f:
+            json.dump(stats_partial, f, indent=2)
 
     early_stop = False
     with futures.ProcessPoolExecutor(
@@ -319,24 +386,59 @@ def main():
                 args.n_mels,
                 hf_token,
                 args.chunk_sec,
+                args.timeout_sec,
             ): entry
             for entry in entries_to_process
         }
 
         for idx, future in enumerate(futures.as_completed(future_to_entry), start=1):
+            entry = future_to_entry[future]
+            attempted += 1
             try:
                 results = future.result()
-            except Exception:
+            except Exception as exc:
                 results = None
                 error_count += 1
+                key = get_value(entry, ["vad_key", "key", "__key__"])
+                tar_number = get_value(entry, ["tar_number"])
+                lid = get_value(entry, ["lid", "lang"])
+                seg = _get_segment_bounds(entry)
+                start_sec, end_sec = (seg if seg else (None, None))
+                chunk_id = entry.get("chunk_id")
+                if not chunk_id and key is not None and seg is not None:
+                    chunk_id = f"{key}__{start_sec:.3f}__{end_sec:.3f}"
+                _log_error(
+                    {
+                        "chunk_id": chunk_id,
+                        "key": key,
+                        "tar_number": tar_number,
+                        "start_sec": start_sec,
+                        "end_sec": end_sec,
+                        "lid": lid,
+                    },
+                    type(exc).__name__,
+                    str(exc),
+                )
 
             if not results:
+                if args.print_every > 0 and attempted % args.print_every == 0:
+                    elapsed = time.time() - start_time
+                    print(
+                        "Progress: "
+                        f"attempted={attempted} ok={processed_count} errors={error_count} "
+                        f"last_chunk_id={last_chunk_id} last_tar_number={last_tar_number} "
+                        f"elapsed_sec={elapsed:.1f}",
+                        flush=True,
+                    )
                 continue
 
             for result in results:
                 chunk_total += 1
-                current_shard.append(result)
+                buffer.append(result)
                 processed_count += 1
+
+                last_chunk_id = result.get("chunk_id")
+                last_tar_number = result.get("tar_number")
 
                 meta = {
                     "chunk_id": result["chunk_id"],
@@ -355,16 +457,10 @@ def main():
                 with open(features_path, "a") as f:
                     f.write(json.dumps(meta) + "\n")
 
-                if len(current_shard) >= args.examples_per_shard:
-                    shard_path = os.path.join(shards_dir, f"shard-{shard_idx:05d}.pt")
-                    torch.save(current_shard, shard_path)
-                    print(
-                        f"Wrote {len(current_shard)} examples to {shard_path} "
-                        f"(processed={processed_count}, errors={error_count})",
-                        flush=True,
-                    )
-                    shard_idx += 1
-                    current_shard = []
+                _flush_buffer()
+
+                if args.write_stats_every > 0 and processed_count % args.write_stats_every == 0:
+                    _write_partial_stats()
 
                 if args.max_examples > 0 and processed_count >= args.max_examples:
                     early_stop = True
@@ -376,19 +472,21 @@ def main():
                         fut.cancel()
                 break
 
-            if idx % 200 == 0:
+            if args.print_every > 0 and attempted % args.print_every == 0:
                 elapsed = time.time() - start_time
                 print(
-                    f"Progress: {idx}/{len(entries_to_process)} futures | "
-                    f"processed={processed_count} errors={error_count} elapsed_sec={elapsed:.1f}",
+                    "Progress: "
+                    f"attempted={attempted} ok={processed_count} errors={error_count} "
+                    f"last_chunk_id={last_chunk_id} last_tar_number={last_tar_number} "
+                    f"elapsed_sec={elapsed:.1f}",
                     flush=True,
                 )
 
-    if current_shard:
+    if buffer:
         shard_path = os.path.join(shards_dir, f"shard-{shard_idx:05d}.pt")
-        torch.save(current_shard, shard_path)
+        torch.save(buffer, shard_path)
         print(
-            f"Wrote {len(current_shard)} examples to {shard_path} "
+            f"Wrote {len(buffer)} examples to {shard_path} "
             f"(processed={processed_count}, errors={error_count})",
             flush=True,
         )
@@ -401,6 +499,7 @@ def main():
         "errors": error_count,
         "elapsed_sec": elapsed,
         "chunks_emitted": chunk_total,
+        "attempted": attempted,
     }
     stats_path = os.path.join(args.out_dir, "stats.json")
     with open(stats_path, "w") as f:
