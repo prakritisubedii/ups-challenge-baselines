@@ -16,6 +16,8 @@ import math
 import os
 import sys
 import time
+import tarfile
+from multiprocessing import Manager
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -28,6 +30,9 @@ sys.path.insert(0, REPO_ROOT)
 
 SAMPLE_RATE_DEFAULT = 16000
 _PROCESSED_CHUNK_IDS: set[str] | None = None
+_CACHE_HIT = None
+_CACHE_MISS = None
+_CACHE_LOCK = None
 
 
 def parse_args():
@@ -43,6 +48,7 @@ def parse_args():
     parser.add_argument("--n_mels", type=int, default=80)
     parser.add_argument("--n_fft", type=int, default=400)
     parser.add_argument("--hop_length", type=int, default=160)
+    parser.add_argument("--tar_cache_dir", type=str, default="/content/ups_cache/tars")
     parser.add_argument("--timeout_sec", type=float, default=25.0)
     parser.add_argument("--print_every", type=int, default=25)
     parser.add_argument("--write_stats_every", type=int, default=200)
@@ -85,6 +91,37 @@ def run_with_timeout(fn, timeout_sec: float):
         return future.result(timeout=timeout_sec)
 
 
+def read_mp3_bytes_from_local_tar(tar_path: str, key: str) -> bytes | None:
+    target = f"{key}.mp3"
+    try:
+        with tarfile.open(tar_path, "r") as tar:
+            direct = f"data/{target}"
+            try:
+                member = tar.getmember(direct)
+                extracted = tar.extractfile(member)
+                if extracted is not None:
+                    return extracted.read()
+            except KeyError:
+                pass
+
+            members = tar.getmembers()
+            for member in members:
+                name = member.name
+                if name.endswith(f"/{target}"):
+                    extracted = tar.extractfile(member)
+                    if extracted is not None:
+                        return extracted.read()
+            for member in members:
+                name = member.name
+                if name.endswith(target):
+                    extracted = tar.extractfile(member)
+                    if extracted is not None:
+                        return extracted.read()
+    except Exception:
+        return None
+    return None
+
+
 def get_value(row: dict, keys: list[str], default=None):
     for k in keys:
         if k in row:
@@ -121,6 +158,7 @@ def process_entry(
     hf_token: str | None,
     chunk_sec: float,
     timeout_sec: float,
+    tar_cache_dir: str,
 ) -> list[dict]:
     key = get_value(entry, ["vad_key", "key", "__key__"])
     if key is None:
@@ -133,9 +171,34 @@ def process_entry(
     if url:
         mp3_bytes = run_with_timeout(lambda: fetch_mp3_bytes_from_url(url, key), timeout_sec)
     elif tar_number is not None:
-        mp3_bytes = run_with_timeout(
-            lambda: fetch_mp3_bytes(int(tar_number), key, hf_token), timeout_sec
-        )
+        tar_path = os.path.join(tar_cache_dir, f"{int(tar_number):06d}.tar")
+        if os.path.exists(tar_path) and os.path.getsize(tar_path) > 0:
+            mp3_bytes = read_mp3_bytes_from_local_tar(tar_path, key)
+            if _CACHE_HIT is not None and _CACHE_MISS is not None:
+                if mp3_bytes is not None:
+                    if _CACHE_LOCK:
+                        with _CACHE_LOCK:
+                            _CACHE_HIT.value += 1
+                    else:
+                        _CACHE_HIT.value += 1
+                else:
+                    if _CACHE_LOCK:
+                        with _CACHE_LOCK:
+                            _CACHE_MISS.value += 1
+                    else:
+                        _CACHE_MISS.value += 1
+        else:
+            if _CACHE_HIT is not None and _CACHE_MISS is not None:
+                if _CACHE_LOCK:
+                    with _CACHE_LOCK:
+                        _CACHE_MISS.value += 1
+                else:
+                    _CACHE_MISS.value += 1
+
+        if mp3_bytes is None:
+            mp3_bytes = run_with_timeout(
+                lambda: fetch_mp3_bytes(int(tar_number), key, hf_token), timeout_sec
+            )
     else:
         raise ValueError("Missing tar_number and url")
 
@@ -274,9 +337,12 @@ def next_shard_index(shards_dir: str) -> int:
         return len(existing)
 
 
-def _init_worker(processed_chunk_ids: set[str]):
-    global _PROCESSED_CHUNK_IDS
+def _init_worker(processed_chunk_ids: set[str], cache_hit, cache_miss, cache_lock):
+    global _PROCESSED_CHUNK_IDS, _CACHE_HIT, _CACHE_MISS, _CACHE_LOCK
     _PROCESSED_CHUNK_IDS = processed_chunk_ids
+    _CACHE_HIT = cache_hit
+    _CACHE_MISS = cache_miss
+    _CACHE_LOCK = cache_lock
 
 
 def main():
@@ -316,6 +382,7 @@ def main():
     segment_mode = bool(sample_entry and _get_segment_bounds(sample_entry))
     print(f"segment_mode_detected: {segment_mode}", flush=True)
     print(f"timeout_sec: {args.timeout_sec}", flush=True)
+    print(f"tar_cache_dir: {args.tar_cache_dir} cache_hit=0 cache_miss=0", flush=True)
 
     shard_idx = next_shard_index(shards_dir)
     buffer = []
@@ -372,9 +439,16 @@ def main():
         with open(stats_partial_path, "w") as f:
             json.dump(stats_partial, f, indent=2)
 
+    manager = Manager()
+    cache_hit = manager.Value("i", 0)
+    cache_miss = manager.Value("i", 0)
+    cache_lock = manager.Lock()
+
     early_stop = False
     with futures.ProcessPoolExecutor(
-        max_workers=args.num_workers, initializer=_init_worker, initargs=(processed,)
+        max_workers=args.num_workers,
+        initializer=_init_worker,
+        initargs=(processed, cache_hit, cache_miss, cache_lock),
     ) as executor:
         future_to_entry = {
             executor.submit(
@@ -387,6 +461,7 @@ def main():
                 hf_token,
                 args.chunk_sec,
                 args.timeout_sec,
+                args.tar_cache_dir,
             ): entry
             for entry in entries_to_process
         }
@@ -512,6 +587,10 @@ def main():
 
     print(f"Done. Stats: {stats_path}", flush=True)
     print(f"Wrote config: {cfg_path}", flush=True)
+    print(
+        f"cache_hit: {cache_hit.value} cache_miss: {cache_miss.value}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
