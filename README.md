@@ -62,6 +62,20 @@ From the project root:
 python -m ups_challenge.examples.main
 ```
 
+## Train from precomputed mel shards (Bi-Mamba2 masked modeling)
+
+Example (Colab):
+
+```bash
+python scripts/train_mel_msm_bimamba2.py --precompute_dir /content/drive/MyDrive/ups_precompute/cached_now_full_mel_20260202_220041 --save_dir ./artifacts/msm_bimamba2 --num_steps 20000 --batch_size 8 --ckpt_every 1000 --val_shards 5 --val_every 200 --val_batches 5
+```
+
+Resume:
+
+```bash
+python scripts/train_mel_msm_bimamba2.py --precompute_dir /content/drive/MyDrive/ups_precompute/cached_now_full_mel_20260202_220041 --save_dir ./artifacts/msm_bimamba2 --num_steps 20000 --batch_size 8 --ckpt_every 1000 --val_shards 5 --val_every 200 --val_batches 5 --resume_from ./artifacts/msm_bimamba2/ckpt_step_10000.pt
+```
+
 ## Requirements
 
 - `torch`
