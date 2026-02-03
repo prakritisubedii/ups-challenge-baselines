@@ -180,9 +180,9 @@ def run_val(
     batch_size: int,
     mask_ratio: float,
     device: torch.device,
-    freq: int = 80,
     seed: int,
     val_batches: int,
+    freq: int = 80,
 ):
     if not val_shard_files:
         return None
