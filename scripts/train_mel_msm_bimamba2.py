@@ -75,52 +75,40 @@ class BiMambaMSM(torch.nn.Module):
         return self.proj_out(x)
 
 
-class ShardStream:
-    def __init__(self, shard_files: list[str], shuffle_shards: bool, shuffle_within_shard: bool, seed: int):
-        self.shard_files = list(shard_files)
-        self.shuffle_shards = shuffle_shards
-        self.shuffle_within_shard = shuffle_within_shard
-        self.rng = random.Random(seed)
-
-    def __iter__(self):
-        while True:
-            shard_files = list(self.shard_files)
-            if self.shuffle_shards:
-                self.rng.shuffle(shard_files)
-            for shard_path in shard_files:
-                try:
-                    samples = torch.load(shard_path, map_location="cpu")
-                except Exception:
-                    continue
-                if not isinstance(samples, list):
-                    continue
-                if self.shuffle_within_shard:
-                    self.rng.shuffle(samples)
-                for sample in samples:
-                    if not isinstance(sample, dict):
-                        continue
-                    mel = sample.get("mel")
-                    if mel is None or not isinstance(mel, torch.Tensor):
-                        continue
-                    if mel.ndim != 2 or mel.shape[0] != 80 or mel.shape[1] < 1:
-                        continue
-                    yield mel.float().cpu()
-
-
 def sample_stream(shard_files: list[str], shuffle: bool, shuffle_within_shard: bool, seed: int):
-    return ShardStream(
-        shard_files=shard_files,
-        shuffle_shards=shuffle,
-        shuffle_within_shard=shuffle_within_shard,
-        seed=seed,
-    )
+    rng = random.Random(seed)
+    shard_files = list(shard_files)
+    while True:
+        shard_list = list(shard_files)
+        if shuffle:
+            rng.shuffle(shard_list)
+        for shard_path in shard_list:
+            try:
+                samples = torch.load(shard_path, map_location="cpu")
+            except Exception:
+                continue
+            if not isinstance(samples, list):
+                continue
+            if shuffle_within_shard:
+                rng.shuffle(samples)
+            for sample in samples:
+                if not isinstance(sample, dict):
+                    continue
+                yield sample
 
 
-def collate_batch(samples: list[torch.Tensor]):
-    samples = [s for s in samples if s is not None]
-    if not samples:
+def make_batch(samples: list[dict]):
+    mels = []
+    for sample in samples:
+        mel = sample.get("mel") if isinstance(sample, dict) else None
+        if mel is None or not isinstance(mel, torch.Tensor):
+            continue
+        if mel.ndim != 2 or mel.shape[0] != 80 or mel.shape[1] < 1:
+            continue
+        mels.append(mel.float().cpu())
+    if not mels:
         return None
-    seqs = [s.t().contiguous() for s in samples]  # [T, 80]
+    seqs = [s.t().contiguous() for s in mels]  # [T, 80]
     lengths = [s.shape[0] for s in seqs]
     max_len = max(lengths)
 
@@ -199,14 +187,6 @@ def run_val(
         shuffle_within_shard=False,
         seed=seed,
     )
-    loader = torch.utils.data.DataLoader(
-        stream,
-        batch_size=batch_size,
-        collate_fn=collate_batch,
-        num_workers=0,
-        pin_memory=(device.type == "cuda"),
-    )
-    loader_iter = iter(loader)
 
     rng = torch.Generator(device=device)
     rng.manual_seed(seed)
@@ -215,7 +195,8 @@ def run_val(
     attempts = 0
     while len(losses) < val_batches and attempts < val_batches * 3:
         attempts += 1
-        batch = next(loader_iter)
+        examples = [next(stream) for _ in range(batch_size)]
+        batch = make_batch(examples)
         if batch is None:
             continue
         x, pad_mask, _lengths = batch
@@ -291,21 +272,12 @@ def main():
     else:
         start_step = 0
 
-    stream = sample_stream(
+    train_stream = sample_stream(
         shard_files=train_shard_files,
         shuffle=args.shuffle_shards,
         shuffle_within_shard=args.shuffle_within_shard,
         seed=args.seed,
     )
-
-    loader = torch.utils.data.DataLoader(
-        stream,
-        batch_size=args.batch_size,
-        collate_fn=collate_batch,
-        num_workers=0,
-        pin_memory=(device.type == "cuda"),
-    )
-    loader_iter = iter(loader)
 
     log_path = os.path.join(args.save_dir, "train_log.jsonl")
     start_time = time.time()
@@ -313,7 +285,8 @@ def main():
     rng.manual_seed(args.seed)
 
     for step in range(start_step + 1, args.num_steps + 1):
-        batch = next(loader_iter)
+        examples = [next(train_stream) for _ in range(args.batch_size)]
+        batch = make_batch(examples)
         if batch is None:
             if step % args.log_every == 0:
                 print(f"Step {step}: skipped (empty batch)", flush=True)
