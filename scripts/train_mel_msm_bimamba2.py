@@ -20,6 +20,7 @@ import glob
 import json
 import random
 import time
+from collections import Counter, OrderedDict
 from dataclasses import asdict, dataclass
 from typing import Optional
 
@@ -50,6 +51,9 @@ def parse_args():
     parser.add_argument("--val_every", type=int, default=200)
     parser.add_argument("--val_batches", type=int, default=5)
     parser.add_argument("--resume_from", type=str, default="")
+    parser.add_argument("--sampling_mode", type=str, default="natural", choices=["natural", "balanced", "hybrid"])
+    parser.add_argument("--hybrid_balanced_frac", type=float, default=0.30)
+    parser.add_argument("--lid_cache_path", type=str, default="")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--shuffle_shards", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shuffle_within_shard", action=argparse.BooleanOptionalAction, default=True)
@@ -95,6 +99,56 @@ def sample_stream(shard_files: list[str], shuffle: bool, shuffle_within_shard: b
                 if not isinstance(sample, dict):
                     continue
                 yield sample
+
+
+class ShardLRUCache:
+    def __init__(self, max_items: int = 3):
+        self.max_items = max_items
+        self.cache = OrderedDict()
+
+    def get(self, shard_path: str):
+        if shard_path in self.cache:
+            self.cache.move_to_end(shard_path)
+            return self.cache[shard_path]
+        samples = torch.load(shard_path, map_location="cpu")
+        self.cache[shard_path] = samples
+        if len(self.cache) > self.max_items:
+            self.cache.popitem(last=False)
+        return samples
+
+
+def load_lid_index(lid_cache_path: str, shard_files: list[str]):
+    if not lid_cache_path or not os.path.exists(lid_cache_path):
+        return None
+    with open(lid_cache_path, "r") as f:
+        data = json.load(f)
+    shard_set = set(shard_files)
+    index = {}
+    for lid, refs in data.items():
+        filtered = [ref for ref in refs if ref[0] in shard_set]
+        if filtered:
+            index[lid] = filtered
+    return index if index else None
+
+
+def build_lid_index(shard_files: list[str]):
+    index = {}
+    for shard_path in shard_files:
+        try:
+            samples = torch.load(shard_path, map_location="cpu")
+        except Exception:
+            continue
+        if not isinstance(samples, list):
+            continue
+        for i, sample in enumerate(samples):
+            if not isinstance(sample, dict):
+                continue
+            lid = sample.get("lid")
+            if lid is None:
+                continue
+            lid_key = str(lid)
+            index.setdefault(lid_key, []).append([shard_path, i])
+    return index
 
 
 def make_batch(samples: list[dict]):
@@ -144,6 +198,7 @@ class TrainLog:
     loss: float
     val_loss: Optional[float]
     elapsed_sec: float
+    batch_lid_counts: dict
 
 
 def save_checkpoint(save_dir: str, step: int, model: torch.nn.Module, optimizer: torch.optim.Optimizer, cfg: dict):
@@ -278,6 +333,18 @@ def main():
         shuffle_within_shard=args.shuffle_within_shard,
         seed=args.seed,
     )
+    sampling_rng = random.Random(args.seed + 7)
+    lid_index = None
+    if args.sampling_mode != "natural":
+        lid_index = load_lid_index(args.lid_cache_path, train_shard_files)
+        if lid_index is None:
+            lid_index = build_lid_index(train_shard_files)
+            if args.lid_cache_path:
+                os.makedirs(os.path.dirname(args.lid_cache_path) or ".", exist_ok=True)
+                with open(args.lid_cache_path, "w") as f:
+                    json.dump(lid_index, f)
+    lid_cache = ShardLRUCache(max_items=3)
+    lid_keys = list(lid_index.keys()) if lid_index else []
 
     log_path = os.path.join(args.save_dir, "train_log.jsonl")
     start_time = time.time()
@@ -285,7 +352,25 @@ def main():
     rng.manual_seed(args.seed)
 
     for step in range(start_step + 1, args.num_steps + 1):
-        examples = [next(train_stream) for _ in range(args.batch_size)]
+        examples = []
+        for _ in range(args.batch_size):
+            use_balanced = args.sampling_mode == "balanced"
+            if args.sampling_mode == "hybrid":
+                use_balanced = sampling_rng.random() < args.hybrid_balanced_frac
+
+            if use_balanced and lid_index and lid_keys:
+                lid = sampling_rng.choice(lid_keys)
+                refs = lid_index.get(lid, [])
+                if refs:
+                    shard_fp, idx = sampling_rng.choice(refs)
+                    try:
+                        shard_samples = lid_cache.get(shard_fp)
+                        if isinstance(shard_samples, list) and 0 <= idx < len(shard_samples):
+                            examples.append(shard_samples[idx])
+                            continue
+                    except Exception:
+                        pass
+            examples.append(next(train_stream))
         batch = make_batch(examples)
         if batch is None:
             if step % args.log_every == 0:
@@ -307,6 +392,11 @@ def main():
         loss_val = float(loss.detach().cpu().item())
         elapsed = time.time() - start_time
 
+        batch_lid_counts = Counter()
+        for sample in examples:
+            if isinstance(sample, dict) and "lid" in sample:
+                batch_lid_counts[str(sample["lid"])] += 1
+
         if step % args.log_every == 0:
             if val_shard_files and step % args.val_every == 0:
                 val_loss = run_val(
@@ -327,12 +417,19 @@ def main():
                 "loss": loss_val,
                 "val_loss": val_loss,
                 "elapsed_sec": elapsed,
+                "batch_lid_counts": dict(batch_lid_counts),
             }
             print(log_payload, flush=True)
         else:
             val_loss = None
 
-        log_entry = TrainLog(step=step, loss=loss_val, val_loss=val_loss, elapsed_sec=elapsed)
+        log_entry = TrainLog(
+            step=step,
+            loss=loss_val,
+            val_loss=val_loss,
+            elapsed_sec=elapsed,
+            batch_lid_counts=dict(batch_lid_counts),
+        )
         with open(log_path, "a") as f:
             f.write(json.dumps(asdict(log_entry)) + "\n")
 
