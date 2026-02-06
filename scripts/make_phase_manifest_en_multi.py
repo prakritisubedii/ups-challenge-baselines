@@ -33,62 +33,37 @@ def parse_args():
 
 
 def load_exclude_tars(path: str | None):
-    raw_set: set[str] = set()
     int_set: set[int] = set()
-    unique_keys: set[str] = set()
+    unique_keys: set[int] = set()
     if path is None:
-        return raw_set, int_set, 0
+        return int_set, 0
 
     with open(path, "r") as f:
         for line in f:
             raw = line.strip()
             if not raw:
                 continue
-            raw_set.add(raw)
-            unique_keys.add(f"str:{raw}")
             try:
                 if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
                     val = int(raw)
                     int_set.add(val)
-                    unique_keys.add(f"int:{val}")
+                    unique_keys.add(val)
             except ValueError:
                 pass
-    return raw_set, int_set, len(unique_keys)
+    return int_set, len(unique_keys)
 
 
-def tar_is_excluded(tar_number, raw_set: set[str], int_set: set[int]) -> bool:
-    if tar_number is None:
+def tar_is_excluded(tar_int: int | None, int_set: set[int]) -> bool:
+    if tar_int is None:
         return False
-    if isinstance(tar_number, int):
-        if tar_number in int_set:
-            return True
-        return str(tar_number) in raw_set
-    if isinstance(tar_number, str):
-        t = tar_number.strip()
-        if t in raw_set:
-            return True
-        if t.isdigit() or (t.startswith("-") and t[1:].isdigit()):
-            try:
-                return int(t) in int_set
-            except ValueError:
-                return False
-        return False
-    try:
-        val = int(tar_number)
-        if val in int_set:
-            return True
-    except (TypeError, ValueError):
-        pass
-    return str(tar_number) in raw_set
+    return tar_int in int_set
 
 
 def count_by_lid(rows: list[dict]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for row in rows:
-        lid = row.get("lid")
-        if lid is None:
-            continue
-        counts[lid] = counts.get(lid, 0) + 1
+        lang = row.get("lang") or row.get("lid") or "MISSING"
+        counts[lang] = counts.get(lang, 0) + 1
     return counts
 
 
@@ -105,7 +80,7 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    raw_exclude, int_exclude, exclude_id_count = load_exclude_tars(args.exclude_tars)
+    int_exclude, exclude_id_count = load_exclude_tars(args.exclude_tars)
 
     total_rows = 0
     skipped_excluded = 0
@@ -123,15 +98,19 @@ def main() -> None:
             except json.JSONDecodeError:
                 continue
 
-            tar_number = row.get("tar_number")
-            if tar_is_excluded(tar_number, raw_exclude, int_exclude):
+            tar = row.get("tar_number")
+            try:
+                tar_int = int(tar) if tar is not None else None
+            except (TypeError, ValueError):
+                tar_int = None
+            if tar_is_excluded(tar_int, int_exclude):
                 skipped_excluded += 1
                 continue
 
-            lid = row.get("lid")
-            if lid == "en":
+            lang = row.get("lang") or row.get("lid") or "MISSING"
+            if lang == "en":
                 en_rows.append(row)
-            elif lid is not None and lid != "nospeech":
+            elif lang != "nospeech":
                 multi_rows.append(row)
 
     rng_en = random.Random(args.seed)
@@ -155,12 +134,10 @@ def main() -> None:
     for idx, row in enumerate(multi_rows):
         if len(multi_selected) >= args.n_multi:
             break
-        lid = row.get("lid")
-        if lid is None:
-            continue
-        if multi_counts.get(lid, 0) < cap:
+        lang = row.get("lang") or row.get("lid") or "MISSING"
+        if multi_counts.get(lang, 0) < cap:
             multi_selected.append(row)
-            multi_counts[lid] = multi_counts.get(lid, 0) + 1
+            multi_counts[lang] = multi_counts.get(lang, 0) + 1
             selected_indices.add(idx)
 
     relaxed_cap = cap
@@ -176,12 +153,10 @@ def main() -> None:
                 break
             if idx in selected_indices:
                 continue
-            lid = row.get("lid")
-            if lid is None:
-                continue
-            if multi_counts.get(lid, 0) < relaxed_cap:
+            lang = row.get("lang") or row.get("lid") or "MISSING"
+            if multi_counts.get(lang, 0) < relaxed_cap:
                 multi_selected.append(row)
-                multi_counts[lid] = multi_counts.get(lid, 0) + 1
+                multi_counts[lang] = multi_counts.get(lang, 0) + 1
                 selected_indices.add(idx)
 
     if len(multi_selected) < args.n_multi:
