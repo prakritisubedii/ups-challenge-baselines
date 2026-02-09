@@ -1,0 +1,5 @@
+{
+  "__comment__": "Replace wav_b64 with base64-encoded WAV bytes before running the smoke test.",
+  "wav_b64": "REPLACE_ME_WITH_BASE64_WAV",
+  "sr": 16000
+}
