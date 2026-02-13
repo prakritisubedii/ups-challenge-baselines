@@ -12,17 +12,24 @@ import argparse
 import concurrent.futures as futures
 import glob
 import json
+import logging
 import math
 import os
 import sys
+import tempfile
 import time
 import tarfile
 from multiprocessing import Manager
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
+import torchaudio
 import webdataset as wds
-from torchcodec.decoders import AudioDecoder
+try:
+    from torchcodec.decoders import AudioDecoder
+except (ImportError, RuntimeError):
+    AudioDecoder = None
+    logging.warning("torchcodec unavailable, falling back to torchaudio")
 
 # Make sure Python can import from this repo
 REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -154,6 +161,18 @@ def _get_segment_bounds(entry: dict):
     return start_f, end_f
 
 
+def load_audio(path: str, target_sr: int = SAMPLE_RATE_DEFAULT) -> torch.Tensor:
+    waveform, source_sr = torchaudio.load(path)
+    waveform = waveform.to(torch.float32)
+    if waveform.ndim == 1:
+        waveform = waveform.unsqueeze(0)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    if source_sr != target_sr:
+        waveform = torchaudio.functional.resample(waveform, source_sr, target_sr)
+    return waveform.squeeze(0).contiguous()
+
+
 def process_entry(
     entry: dict,
     sr: int,
@@ -165,6 +184,7 @@ def process_entry(
     timeout_sec: float,
     tar_cache_dir: str,
 ) -> list[dict]:
+    global AudioDecoder
     key = get_value(entry, ["vad_key", "key", "__key__"])
     if key is None:
         raise ValueError("Missing vad_key")
@@ -212,104 +232,165 @@ def process_entry(
 
     lid = get_value(entry, ["lid", "lang"])
     results = []
+    temp_mp3_path = None
 
-    segment_bounds = _get_segment_bounds(entry)
-    if segment_bounds is not None:
-        start_sec, end_sec = segment_bounds
-        expected = int(round((end_sec - start_sec) * sr))
-        if expected <= 0:
-            raise ValueError("Invalid segment duration")
-        chunk_id = entry.get("chunk_id") or f"{key}__{start_sec:.3f}__{end_sec:.3f}"
+    def _get_temp_mp3_path() -> str:
+        nonlocal temp_mp3_path
+        if temp_mp3_path is None:
+            fd, path = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
+            with open(path, "wb") as f:
+                f.write(mp3_bytes)
+            temp_mp3_path = path
+        return temp_mp3_path
 
-        if _PROCESSED_CHUNK_IDS and chunk_id in _PROCESSED_CHUNK_IDS:
-            return []
+    def _decode_with_torchaudio() -> torch.Tensor:
+        return load_audio(_get_temp_mp3_path(), sr)
 
-        def _decode_segment():
-            decoder = AudioDecoder(source=mp3_bytes, sample_rate=sr, num_channels=1)
-            return decoder.get_samples_played_in_range(start_sec, end_sec)
+    try:
+        segment_bounds = _get_segment_bounds(entry)
+        if segment_bounds is not None:
+            start_sec, end_sec = segment_bounds
+            expected = int(round((end_sec - start_sec) * sr))
+            if expected <= 0:
+                raise ValueError("Invalid segment duration")
+            chunk_id = entry.get("chunk_id") or f"{key}__{start_sec:.3f}__{end_sec:.3f}"
 
-        samples = run_with_timeout(_decode_segment, timeout_sec)
-        chunk = samples.data.squeeze(0)
+            if _PROCESSED_CHUNK_IDS and chunk_id in _PROCESSED_CHUNK_IDS:
+                return []
 
-        if chunk.shape[-1] < expected:
-            pad = expected - chunk.shape[-1]
-            chunk = torch.nn.functional.pad(chunk, (0, pad))
-        elif chunk.shape[-1] > expected:
-            chunk = chunk[..., :expected]
+            chunk = None
+            if AudioDecoder is not None:
+                try:
+                    def _decode_segment():
+                        decoder = AudioDecoder(source=mp3_bytes, sample_rate=sr, num_channels=1)
+                        return decoder.get_samples_played_in_range(start_sec, end_sec)
 
-        waveform = chunk.unsqueeze(0)
-        log_mel = waveform_to_log_mel(waveform, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels)
-        mel = log_mel.squeeze(0).float().cpu()
+                    samples = run_with_timeout(_decode_segment, timeout_sec)
+                    chunk = samples.data.squeeze(0)
+                except RuntimeError:
+                    AudioDecoder = None
+                    logging.warning("torchcodec unavailable, falling back to torchaudio")
 
-        out = {
-            "chunk_id": chunk_id,
-            "key": key,
-            "start_sec": float(start_sec),
-            "end_sec": float(end_sec),
-            "sr": int(sr),
-            "mel": mel,
-        }
-        if url:
-            out["url"] = url
-        if lid is not None:
-            out["lid"] = lid
-        if tar_number is not None:
-            out["tar_number"] = int(tar_number)
+            if chunk is None:
+                waveform_full = run_with_timeout(_decode_with_torchaudio, timeout_sec)
+                start_idx = int(round(start_sec * sr))
+                end_idx = int(round(end_sec * sr))
+                chunk = waveform_full[start_idx:end_idx]
 
-        return [out]
+            if chunk.shape[-1] < expected:
+                pad = expected - chunk.shape[-1]
+                chunk = torch.nn.functional.pad(chunk, (0, pad))
+            elif chunk.shape[-1] > expected:
+                chunk = chunk[..., :expected]
 
-    def _get_duration():
-        decoder = AudioDecoder(source=mp3_bytes, sample_rate=sr, num_channels=1)
-        return decoder.metadata.duration_seconds_from_header
+            waveform = chunk.unsqueeze(0)
+            log_mel = waveform_to_log_mel(waveform, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels)
+            mel = log_mel.squeeze(0).float().cpu()
 
-    duration = run_with_timeout(_get_duration, timeout_sec)
-    if duration is None or duration <= 0:
-        raise ValueError("Invalid duration")
+            out = {
+                "chunk_id": chunk_id,
+                "key": key,
+                "start_sec": float(start_sec),
+                "end_sec": float(end_sec),
+                "sr": int(sr),
+                "mel": mel,
+            }
+            if url:
+                out["url"] = url
+            if lid is not None:
+                out["lid"] = lid
+            if tar_number is not None:
+                out["tar_number"] = int(tar_number)
 
-    chunk_count = max(1, int(math.ceil(duration / chunk_sec)))
-    expected = int(chunk_sec * sr)
+            return [out]
 
-    for idx in range(chunk_count):
-        start_sec = idx * chunk_sec
-        end_sec = min(start_sec + chunk_sec, duration)
-        chunk_id = build_chunk_id(str(key), tar_number if tar_number is not None else None, idx)
+        duration = None
+        if AudioDecoder is not None:
+            try:
+                def _get_duration():
+                    decoder = AudioDecoder(source=mp3_bytes, sample_rate=sr, num_channels=1)
+                    return decoder.metadata.duration_seconds_from_header
 
-        if _PROCESSED_CHUNK_IDS and chunk_id in _PROCESSED_CHUNK_IDS:
-            continue
+                duration = run_with_timeout(_get_duration, timeout_sec)
+            except RuntimeError:
+                AudioDecoder = None
+                logging.warning("torchcodec unavailable, falling back to torchaudio")
 
-        def _decode_chunk():
-            decoder = AudioDecoder(source=mp3_bytes, sample_rate=sr, num_channels=1)
-            return decoder.get_samples_played_in_range(start_sec, end_sec)
+        waveform_full = None
+        if AudioDecoder is None:
+            waveform_full = run_with_timeout(_decode_with_torchaudio, timeout_sec)
+            duration = waveform_full.shape[-1] / sr
 
-        samples = run_with_timeout(_decode_chunk, timeout_sec)
-        chunk = samples.data.squeeze(0)
+        if duration is None or duration <= 0:
+            raise ValueError("Invalid duration")
 
-        if chunk.shape[-1] < expected:
-            pad = expected - chunk.shape[-1]
-            chunk = torch.nn.functional.pad(chunk, (0, pad))
+        chunk_count = max(1, int(math.ceil(duration / chunk_sec)))
+        expected = int(chunk_sec * sr)
 
-        waveform = chunk.unsqueeze(0)
-        log_mel = waveform_to_log_mel(waveform, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels)
-        mel = log_mel.squeeze(0).float().cpu()
+        for idx in range(chunk_count):
+            start_sec = idx * chunk_sec
+            end_sec = min(start_sec + chunk_sec, duration)
+            chunk_id = build_chunk_id(str(key), tar_number if tar_number is not None else None, idx)
 
-        out = {
-            "chunk_id": chunk_id,
-            "key": key,
-            "start_sec": float(start_sec),
-            "end_sec": float(end_sec),
-            "sr": int(sr),
-            "mel": mel,
-        }
-        if url:
-            out["url"] = url
-        if lid is not None:
-            out["lid"] = lid
-        if tar_number is not None:
-            out["tar_number"] = int(tar_number)
+            if _PROCESSED_CHUNK_IDS and chunk_id in _PROCESSED_CHUNK_IDS:
+                continue
 
-        results.append(out)
+            if AudioDecoder is not None:
+                try:
+                    def _decode_chunk():
+                        decoder = AudioDecoder(source=mp3_bytes, sample_rate=sr, num_channels=1)
+                        return decoder.get_samples_played_in_range(start_sec, end_sec)
 
-    return results
+                    samples = run_with_timeout(_decode_chunk, timeout_sec)
+                    chunk = samples.data.squeeze(0)
+                except RuntimeError:
+                    AudioDecoder = None
+                    logging.warning("torchcodec unavailable, falling back to torchaudio")
+                    if waveform_full is None:
+                        waveform_full = run_with_timeout(_decode_with_torchaudio, timeout_sec)
+                    start_idx = int(round(start_sec * sr))
+                    end_idx = int(round(end_sec * sr))
+                    chunk = waveform_full[start_idx:end_idx]
+            else:
+                if waveform_full is None:
+                    waveform_full = run_with_timeout(_decode_with_torchaudio, timeout_sec)
+                start_idx = int(round(start_sec * sr))
+                end_idx = int(round(end_sec * sr))
+                chunk = waveform_full[start_idx:end_idx]
+
+            if chunk.shape[-1] < expected:
+                pad = expected - chunk.shape[-1]
+                chunk = torch.nn.functional.pad(chunk, (0, pad))
+
+            waveform = chunk.unsqueeze(0)
+            log_mel = waveform_to_log_mel(waveform, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels)
+            mel = log_mel.squeeze(0).float().cpu()
+
+            out = {
+                "chunk_id": chunk_id,
+                "key": key,
+                "start_sec": float(start_sec),
+                "end_sec": float(end_sec),
+                "sr": int(sr),
+                "mel": mel,
+            }
+            if url:
+                out["url"] = url
+            if lid is not None:
+                out["lid"] = lid
+            if tar_number is not None:
+                out["tar_number"] = int(tar_number)
+
+            results.append(out)
+
+        return results
+    finally:
+        if temp_mp3_path and os.path.exists(temp_mp3_path):
+            try:
+                os.remove(temp_mp3_path)
+            except OSError:
+                pass
 
 
 def load_processed_chunk_ids(features_path: str) -> set[str]:
