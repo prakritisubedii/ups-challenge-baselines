@@ -43,7 +43,12 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_examples", type=int, default=-1)
     parser.add_argument("--resume", type=int, default=1)
-    parser.add_argument("--chunk_sec", type=float, default=2.0)
+    parser.add_argument(
+        "--chunk_sec",
+        type=float,
+        default=10.0,
+        help="Chunk length in seconds when segment boundaries are not provided; default 10.0s (recommended for UPS).",
+    )
     parser.add_argument("--sr", type=int, default=16000)
     parser.add_argument("--n_mels", type=int, default=80)
     parser.add_argument("--n_fft", type=int, default=400)
