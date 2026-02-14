@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import requests
 import subprocess
 import sys
 import tempfile
@@ -66,6 +67,12 @@ def parse_args():
     parser.add_argument("--n_fft", type=int, default=400)
     parser.add_argument("--hop_length", type=int, default=160)
     parser.add_argument("--tar_cache_dir", type=str, default="/content/ups_cache/tars")
+    parser.add_argument(
+        "--debug_cache",
+        type=int,
+        default=0,
+        help="Enable verbose tar cache hit/miss/debug logging.",
+    )
     parser.add_argument(
         "--vad_segments_cache",
         type=str,
@@ -143,7 +150,7 @@ def load_vad_segments_cache(vad_segments_cache_path: str) -> dict[str, list[dict
     return segments_by_key
 
 
-from ups_challenge.audio_precompute import tar_url_for_number, fetch_mp3_bytes, waveform_to_log_mel
+from ups_challenge.audio_precompute import fetch_mp3_bytes, waveform_to_log_mel
 
 
 def fetch_mp3_bytes_from_url(url: str, key: str):
@@ -192,6 +199,106 @@ def read_mp3_bytes_from_local_tar(tar_path: str, key: str) -> bytes | None:
     except Exception:
         return None
     return None
+
+
+def _cache_counter_inc(counter):
+    if counter is None:
+        return
+    if _CACHE_LOCK:
+        with _CACHE_LOCK:
+            counter.value += 1
+    else:
+        counter.value += 1
+
+
+def _acquire_lockfile(lock_path: str, timeout_sec: float = 120.0, poll_sec: float = 0.25) -> bool:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return True
+        except FileExistsError:
+            time.sleep(poll_sec)
+    return False
+
+
+def ensure_tar_cached(
+    tar_number: int,
+    tar_cache_dir: str,
+    hf_token: str | None,
+    timeout_sec: float,
+    debug_cache: bool,
+) -> tuple[str, bool]:
+    tar_number_str = f"{int(tar_number):06d}"
+    tar_path = os.path.join(tar_cache_dir, f"{tar_number_str}.tar")
+    lock_path = tar_path + ".lock"
+    os.makedirs(tar_cache_dir, exist_ok=True)
+
+    if os.path.exists(tar_path) and os.path.getsize(tar_path) > 0:
+        if debug_cache:
+            print(
+                f"cache HIT tar_number={tar_number_str} path={tar_path} size={os.path.getsize(tar_path)}",
+                flush=True,
+            )
+        return tar_path, True
+
+    if debug_cache:
+        print(f"cache MISS tar_number={tar_number_str} path={tar_path}", flush=True)
+
+    if not _acquire_lockfile(lock_path):
+        raise RuntimeError(f"Timeout acquiring cache lock for {tar_path}")
+
+    try:
+        if os.path.exists(tar_path) and os.path.getsize(tar_path) > 0:
+            if debug_cache:
+                print(
+                    f"cache FILLED_BY_OTHER tar_number={tar_number_str} path={tar_path} "
+                    f"size={os.path.getsize(tar_path)}",
+                    flush=True,
+                )
+            return tar_path, True
+
+        if hf_token is None:
+            raise RuntimeError("HF_TOKEN is required to populate tar cache")
+        if int(tar_number_str) <= 5000:
+            base = "https://huggingface.co/datasets/MLCommons/unsupervised_peoples_speech/resolve/main/audio"
+        else:
+            base = "https://huggingface.co/datasets/MLCommons/unsupervised_peoples_speech/resolve/main/audio2"
+        tar_url = f"{base}/{tar_number_str}.tar?download=True"
+        headers = {"Authorization": f"Bearer {hf_token}"}
+
+        tmp_path = tar_path + f".tmp.{os.getpid()}"
+        try:
+            with requests.get(tar_url, headers=headers, stream=True, timeout=timeout_sec) as resp:
+                resp.raise_for_status()
+                with open(tmp_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+            if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) <= 0:
+                raise RuntimeError(f"Downloaded tar is empty for tar_number={tar_number_str}")
+            os.replace(tmp_path, tar_path)
+            if debug_cache:
+                print(
+                    f"cache DOWNLOADED tar_number={tar_number_str} path={tar_path} "
+                    f"size={os.path.getsize(tar_path)} retained_on_disk=1",
+                    flush=True,
+                )
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+    finally:
+        if os.path.exists(lock_path):
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
+
+    return tar_path, False
 
 
 def get_value(row: dict, keys: list[str], default=None):
@@ -300,6 +407,7 @@ def process_entry(
     timeout_sec: float,
     tar_cache_dir: str,
     force_ffmpeg_decode: bool,
+    debug_cache: bool,
 ) -> list[dict]:
     global AudioDecoder
     key = get_value(entry, ["vad_key", "key", "__key__"])
@@ -313,31 +421,25 @@ def process_entry(
     if url:
         mp3_bytes = run_with_timeout(lambda: fetch_mp3_bytes_from_url(url, key), timeout_sec)
     elif tar_number is not None:
-        tar_path = os.path.join(tar_cache_dir, f"{int(tar_number):06d}.tar")
-        if os.path.exists(tar_path) and os.path.getsize(tar_path) > 0:
-            mp3_bytes = read_mp3_bytes_from_local_tar(tar_path, key)
-            if _CACHE_HIT is not None and _CACHE_MISS is not None:
-                if mp3_bytes is not None:
-                    if _CACHE_LOCK:
-                        with _CACHE_LOCK:
-                            _CACHE_HIT.value += 1
-                    else:
-                        _CACHE_HIT.value += 1
-                else:
-                    if _CACHE_LOCK:
-                        with _CACHE_LOCK:
-                            _CACHE_MISS.value += 1
-                    else:
-                        _CACHE_MISS.value += 1
+        tar_path, was_hit = ensure_tar_cached(
+            int(tar_number),
+            tar_cache_dir=tar_cache_dir,
+            hf_token=hf_token,
+            timeout_sec=timeout_sec,
+            debug_cache=debug_cache,
+        )
+        if was_hit:
+            _cache_counter_inc(_CACHE_HIT)
         else:
-            if _CACHE_HIT is not None and _CACHE_MISS is not None:
-                if _CACHE_LOCK:
-                    with _CACHE_LOCK:
-                        _CACHE_MISS.value += 1
-                else:
-                    _CACHE_MISS.value += 1
-
+            _cache_counter_inc(_CACHE_MISS)
+        mp3_bytes = read_mp3_bytes_from_local_tar(tar_path, key)
         if mp3_bytes is None:
+            if debug_cache:
+                print(
+                    f"cache READ_MISS key={key} tar_number={int(tar_number):06d} path={tar_path}; "
+                    "falling back to stream fetch",
+                    flush=True,
+                )
             mp3_bytes = run_with_timeout(
                 lambda: fetch_mp3_bytes(int(tar_number), key, hf_token), timeout_sec
             )
@@ -653,6 +755,12 @@ def main():
     print(f"segment_mode_detected: {segment_mode}", flush=True)
     print(f"timeout_sec: {args.timeout_sec}", flush=True)
     print(f"tar_cache_dir: {args.tar_cache_dir} cache_hit=0 cache_miss=0", flush=True)
+    if args.debug_cache:
+        print(
+            f"debug_cache=1 resolved_tar_cache_dir={os.path.abspath(args.tar_cache_dir)} "
+            f"exists={os.path.exists(args.tar_cache_dir)} writable={os.access(args.tar_cache_dir, os.W_OK) if os.path.exists(args.tar_cache_dir) else 'n/a'}",
+            flush=True,
+        )
     if args.vad_segments_cache:
         print(
             f"vad_segments_cache: {args.vad_segments_cache} "
@@ -743,6 +851,7 @@ def main():
                     args.timeout_sec,
                     args.tar_cache_dir,
                     bool(args.force_ffmpeg_decode),
+                    bool(args.debug_cache),
                 )
             except Exception as exc:
                 results = None
@@ -869,6 +978,7 @@ def main():
                                 args.timeout_sec,
                                 args.tar_cache_dir,
                                 bool(args.force_ffmpeg_decode),
+                                bool(args.debug_cache),
                             )
                         except BrokenProcessPool:
                             attempted += 1
