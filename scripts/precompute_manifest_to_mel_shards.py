@@ -601,39 +601,28 @@ def main():
         with open(stats_partial_path, "w") as f:
             json.dump(stats_partial, f, indent=2)
 
-    manager = Manager()
-    cache_hit = manager.Value("i", 0)
-    cache_miss = manager.Value("i", 0)
-    cache_lock = manager.Lock()
-
     early_stop = False
-    with futures.ProcessPoolExecutor(
-        max_workers=args.num_workers,
-        initializer=_init_worker,
-        initargs=(processed, cache_hit, cache_miss, cache_lock),
-    ) as executor:
-        future_to_entry = {
-            executor.submit(
-                process_entry,
-                entry,
-                args.sr,
-                args.n_fft,
-                args.hop_length,
-                args.n_mels,
-                hf_token,
-                args.chunk_sec,
-                args.timeout_sec,
-                args.tar_cache_dir,
-                bool(args.force_ffmpeg_decode),
-            ): entry
-            for entry in entries_to_process
-        }
+    cache_hit = None
+    cache_miss = None
 
-        for idx, future in enumerate(futures.as_completed(future_to_entry), start=1):
-            entry = future_to_entry[future]
+    if args.num_workers <= 1:
+        print("running in SEQUENTIAL mode", flush=True)
+        _init_worker(processed, None, None, None)
+        for idx, entry in enumerate(entries_to_process, start=1):
             attempted += 1
             try:
-                results = future.result()
+                results = process_entry(
+                    entry,
+                    args.sr,
+                    args.n_fft,
+                    args.hop_length,
+                    args.n_mels,
+                    hf_token,
+                    args.chunk_sec,
+                    args.timeout_sec,
+                    args.tar_cache_dir,
+                    bool(args.force_ffmpeg_decode),
+                )
             except Exception as exc:
                 results = None
                 error_count += 1
@@ -704,12 +693,6 @@ def main():
                     early_stop = True
                     break
 
-            if early_stop:
-                for fut in future_to_entry:
-                    if not fut.done():
-                        fut.cancel()
-                break
-
             if args.print_every > 0 and attempted % args.print_every == 0:
                 elapsed = time.time() - start_time
                 print(
@@ -719,6 +702,126 @@ def main():
                     f"elapsed_sec={elapsed:.1f}",
                     flush=True,
                 )
+            if early_stop:
+                break
+    else:
+        manager = Manager()
+        cache_hit = manager.Value("i", 0)
+        cache_miss = manager.Value("i", 0)
+        cache_lock = manager.Lock()
+
+        with futures.ProcessPoolExecutor(
+            max_workers=args.num_workers,
+            initializer=_init_worker,
+            initargs=(processed, cache_hit, cache_miss, cache_lock),
+        ) as executor:
+            future_to_entry = {
+                executor.submit(
+                    process_entry,
+                    entry,
+                    args.sr,
+                    args.n_fft,
+                    args.hop_length,
+                    args.n_mels,
+                    hf_token,
+                    args.chunk_sec,
+                    args.timeout_sec,
+                    args.tar_cache_dir,
+                    bool(args.force_ffmpeg_decode),
+                ): entry
+                for entry in entries_to_process
+            }
+
+            for idx, future in enumerate(futures.as_completed(future_to_entry), start=1):
+                entry = future_to_entry[future]
+                attempted += 1
+                try:
+                    results = future.result()
+                except Exception as exc:
+                    results = None
+                    error_count += 1
+                    key = get_value(entry, ["vad_key", "key", "__key__"])
+                    tar_number = get_value(entry, ["tar_number"])
+                    lid = get_value(entry, ["lid", "lang"])
+                    seg = _get_segment_bounds(entry)
+                    start_sec, end_sec = (seg if seg else (None, None))
+                    chunk_id = entry.get("chunk_id")
+                    if not chunk_id and key is not None and seg is not None:
+                        chunk_id = f"{key}__{start_sec:.3f}__{end_sec:.3f}"
+                    _log_error(
+                        {
+                            "chunk_id": chunk_id,
+                            "key": key,
+                            "tar_number": tar_number,
+                            "start_sec": start_sec,
+                            "end_sec": end_sec,
+                            "lid": lid,
+                        },
+                        type(exc).__name__,
+                        str(exc),
+                    )
+
+                if not results:
+                    if args.print_every > 0 and attempted % args.print_every == 0:
+                        elapsed = time.time() - start_time
+                        print(
+                            "Progress: "
+                            f"attempted={attempted} ok={processed_count} errors={error_count} "
+                            f"last_chunk_id={last_chunk_id} last_tar_number={last_tar_number} "
+                            f"elapsed_sec={elapsed:.1f}",
+                            flush=True,
+                        )
+                    continue
+
+                for result in results:
+                    chunk_total += 1
+                    buffer.append(result)
+                    processed_count += 1
+
+                    last_chunk_id = result.get("chunk_id")
+                    last_tar_number = result.get("tar_number")
+
+                    meta = {
+                        "chunk_id": result["chunk_id"],
+                        "key": result["key"],
+                        "start_sec": result["start_sec"],
+                        "end_sec": result["end_sec"],
+                        "sr": result["sr"],
+                    }
+                    if "url" in result:
+                        meta["url"] = result["url"]
+                    if "lid" in result:
+                        meta["lid"] = result["lid"]
+                    if "tar_number" in result:
+                        meta["tar_number"] = result["tar_number"]
+
+                    with open(features_path, "a") as f:
+                        f.write(json.dumps(meta) + "\n")
+
+                    _flush_buffer()
+
+                    if args.write_stats_every > 0 and processed_count % args.write_stats_every == 0:
+                        _write_partial_stats()
+
+                    if args.max_examples > 0 and processed_count >= args.max_examples:
+                        early_stop = True
+                        break
+
+                if early_stop:
+                    for fut in future_to_entry:
+                        if not fut.done():
+                            fut.cancel()
+                    break
+
+                if args.print_every > 0 and attempted % args.print_every == 0:
+                    elapsed = time.time() - start_time
+                    print(
+                        "Progress: "
+                        f"attempted={attempted} ok={processed_count} errors={error_count} "
+                        f"last_chunk_id={last_chunk_id} last_tar_number={last_tar_number} "
+                        f"elapsed_sec={elapsed:.1f}",
+                        flush=True,
+                    )
 
     if buffer:
         shard_path = os.path.join(shards_dir, f"shard-{shard_idx:05d}.pt")
@@ -750,10 +853,9 @@ def main():
 
     print(f"Done. Stats: {stats_path}", flush=True)
     print(f"Wrote config: {cfg_path}", flush=True)
-    print(
-        f"cache_hit: {cache_hit.value} cache_miss: {cache_miss.value}",
-        flush=True,
-    )
+    cache_hit_value = cache_hit.value if cache_hit is not None else 0
+    cache_miss_value = cache_miss.value if cache_miss is not None else 0
+    print(f"cache_hit: {cache_hit_value} cache_miss: {cache_miss_value}", flush=True)
 
 
 if __name__ == "__main__":
