@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -62,6 +63,12 @@ def parse_args():
     parser.add_argument("--hop_length", type=int, default=160)
     parser.add_argument("--tar_cache_dir", type=str, default="/content/ups_cache/tars")
     parser.add_argument("--timeout_sec", type=float, default=25.0)
+    parser.add_argument(
+        "--force_ffmpeg_decode",
+        type=int,
+        default=1,
+        help="Use ffmpeg CLI to decode audio before torchaudio load (default: 1).",
+    )
     parser.add_argument("--print_every", type=int, default=25)
     parser.add_argument("--write_stats_every", type=int, default=200)
     return parser.parse_args()
@@ -161,12 +168,68 @@ def _get_segment_bounds(entry: dict):
     return start_f, end_f
 
 
-def load_audio(path: str, target_sr: int = SAMPLE_RATE_DEFAULT) -> torch.Tensor:
-    waveform, source_sr = torchaudio.load(path)
+def decode_with_ffmpeg_to_wav_then_load(
+    in_path: str, target_sr: int = SAMPLE_RATE_DEFAULT, mono: bool = True
+) -> tuple[torch.Tensor, int]:
+    fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        in_path,
+    ]
+    if mono:
+        cmd.extend(["-ac", "1"])
+    cmd.extend(["-ar", str(target_sr), "-f", "wav", tmp_wav])
+
+    try:
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except FileNotFoundError as exc:
+            raise RuntimeError("ffmpeg is required for audio decoding but was not found in PATH") from exc
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip()
+            raise RuntimeError(f"ffmpeg decode failed for {in_path}: {stderr}") from exc
+
+        try:
+            return torchaudio.load(tmp_wav)
+        except Exception as exc:
+            stderr = (result.stderr or "").strip()
+            suffix = f" ffmpeg_stderr={stderr}" if stderr else ""
+            raise RuntimeError(f"failed to load ffmpeg wav output for {in_path}.{suffix}") from exc
+    finally:
+        if os.path.exists(tmp_wav):
+            try:
+                os.remove(tmp_wav)
+            except OSError:
+                pass
+
+
+def load_audio(
+    path: str,
+    target_sr: int = SAMPLE_RATE_DEFAULT,
+    mono: bool = True,
+    force_ffmpeg_decode: bool = True,
+) -> torch.Tensor:
+    lower_path = path.lower()
+    is_wav = lower_path.endswith(".wav") or lower_path.endswith(".wave")
+    if force_ffmpeg_decode or not is_wav:
+        waveform, source_sr = decode_with_ffmpeg_to_wav_then_load(path, target_sr=target_sr, mono=mono)
+    else:
+        try:
+            waveform, source_sr = torchaudio.load(path)
+        except Exception as exc:
+            raise RuntimeError(f"torchaudio.load failed for {path}: {exc}") from exc
+
     waveform = waveform.to(torch.float32)
     if waveform.ndim == 1:
         waveform = waveform.unsqueeze(0)
-    if waveform.shape[0] > 1:
+    if mono and waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
     if source_sr != target_sr:
         waveform = torchaudio.functional.resample(waveform, source_sr, target_sr)
@@ -183,6 +246,7 @@ def process_entry(
     chunk_sec: float,
     timeout_sec: float,
     tar_cache_dir: str,
+    force_ffmpeg_decode: bool,
 ) -> list[dict]:
     global AudioDecoder
     key = get_value(entry, ["vad_key", "key", "__key__"])
@@ -245,7 +309,19 @@ def process_entry(
         return temp_mp3_path
 
     def _decode_with_torchaudio() -> torch.Tensor:
-        return load_audio(_get_temp_mp3_path(), sr)
+        try:
+            return load_audio(
+                _get_temp_mp3_path(),
+                target_sr=sr,
+                mono=True,
+                force_ffmpeg_decode=force_ffmpeg_decode,
+            )
+        except RuntimeError as exc:
+            logging.error(
+                f"audio decode failure key={key} tar_number={tar_number}: {exc}",
+                exc_info=False,
+            )
+            raise
 
     try:
         segment_bounds = _get_segment_bounds(entry)
@@ -548,6 +624,7 @@ def main():
                 args.chunk_sec,
                 args.timeout_sec,
                 args.tar_cache_dir,
+                bool(args.force_ffmpeg_decode),
             ): entry
             for entry in entries_to_process
         }
