@@ -42,6 +42,9 @@ _PROCESSED_CHUNK_IDS: set[str] | None = None
 _CACHE_HIT = None
 _CACHE_MISS = None
 _CACHE_LOCK = None
+_VAD_SEGMENTS_BY_KEY: dict[str, list[dict]] | None = None
+_VAD_CACHE_ENABLED = False
+_VAD_MISSING_WARNED_KEYS: set[str] | None = None
 
 
 def parse_args():
@@ -63,6 +66,16 @@ def parse_args():
     parser.add_argument("--n_fft", type=int, default=400)
     parser.add_argument("--hop_length", type=int, default=160)
     parser.add_argument("--tar_cache_dir", type=str, default="/content/ups_cache/tars")
+    parser.add_argument(
+        "--vad_segments_cache",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSONL with one object per key: "
+            '{"vad_key":"<key>","timestamps":[{"start":int,"end":int},...]} '
+            "(sample indices at 16kHz)."
+        ),
+    )
     parser.add_argument("--timeout_sec", type=float, default=25.0)
     parser.add_argument(
         "--force_ffmpeg_decode",
@@ -95,6 +108,39 @@ def load_manifest_entries(manifest_path: str) -> tuple[list[dict], int]:
             except json.JSONDecodeError:
                 continue
     return entries, line_count
+
+
+def load_vad_segments_cache(vad_segments_cache_path: str) -> dict[str, list[dict]]:
+    segments_by_key: dict[str, list[dict]] = {}
+    with open(vad_segments_cache_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            vad_key = obj.get("vad_key")
+            timestamps = obj.get("timestamps")
+            if not vad_key or not isinstance(timestamps, list):
+                continue
+
+            cleaned = []
+            for seg in timestamps:
+                if not isinstance(seg, dict):
+                    continue
+                try:
+                    start = int(seg.get("start", 0))
+                    end = int(seg.get("end", 0))
+                except (TypeError, ValueError):
+                    continue
+                if end > start:
+                    cleaned.append({"start": start, "end": end})
+            segments_by_key[str(vad_key)] = cleaned
+    return segments_by_key
 
 
 from ups_challenge.audio_precompute import tar_url_for_number, fetch_mp3_bytes, waveform_to_log_mel
@@ -388,8 +434,35 @@ def process_entry(
 
             return [out]
 
+        vad_windows = None
+        if _VAD_CACHE_ENABLED:
+            key_str = str(key)
+            timestamps = (_VAD_SEGMENTS_BY_KEY or {}).get(key_str)
+            if timestamps is None:
+                if _VAD_MISSING_WARNED_KEYS is not None and key_str not in _VAD_MISSING_WARNED_KEYS:
+                    logging.warning(
+                        f"vad segments missing for key={key} tar_number={tar_number}; "
+                        "falling back to full-duration chunking"
+                    )
+                    _VAD_MISSING_WARNED_KEYS.add(key_str)
+            else:
+                vad_windows = []
+                for seg in timestamps:
+                    start_sample = int(seg.get("start", 0))
+                    end_sample = int(seg.get("end", 0))
+                    if end_sample <= start_sample:
+                        continue
+                    seg_start_sec = start_sample / SAMPLE_RATE_DEFAULT
+                    seg_end_sec = end_sample / SAMPLE_RATE_DEFAULT
+                    if (seg_end_sec - seg_start_sec) < chunk_sec:
+                        continue
+                    t = seg_start_sec
+                    while (t + chunk_sec) <= seg_end_sec:
+                        vad_windows.append((t, t + chunk_sec))
+                        t += chunk_sec
+
         duration = None
-        if AudioDecoder is not None:
+        if AudioDecoder is not None and vad_windows is None:
             try:
                 def _get_duration():
                     decoder = AudioDecoder(source=mp3_bytes, sample_rate=sr, num_channels=1)
@@ -405,15 +478,21 @@ def process_entry(
             waveform_full = run_with_timeout(_decode_with_torchaudio, timeout_sec)
             duration = waveform_full.shape[-1] / sr
 
-        if duration is None or duration <= 0:
-            raise ValueError("Invalid duration")
+        if vad_windows is None:
+            if duration is None or duration <= 0:
+                raise ValueError("Invalid duration")
+            chunk_windows = []
+            chunk_count = max(1, int(math.ceil(duration / chunk_sec)))
+            for idx in range(chunk_count):
+                start_sec = idx * chunk_sec
+                end_sec = min(start_sec + chunk_sec, duration)
+                chunk_windows.append((start_sec, end_sec))
+        else:
+            chunk_windows = vad_windows
 
-        chunk_count = max(1, int(math.ceil(duration / chunk_sec)))
         expected = int(chunk_sec * sr)
 
-        for idx in range(chunk_count):
-            start_sec = idx * chunk_sec
-            end_sec = min(start_sec + chunk_sec, duration)
+        for idx, (start_sec, end_sec) in enumerate(chunk_windows):
             chunk_id = build_chunk_id(str(key), tar_number if tar_number is not None else None, idx)
 
             if _PROCESSED_CHUNK_IDS and chunk_id in _PROCESSED_CHUNK_IDS:
@@ -514,6 +593,21 @@ def _init_worker(processed_chunk_ids: set[str], cache_hit, cache_miss, cache_loc
     _CACHE_LOCK = cache_lock
 
 
+def _init_worker_with_vad(
+    processed_chunk_ids: set[str],
+    cache_hit,
+    cache_miss,
+    cache_lock,
+    vad_segments_by_key: dict[str, list[dict]] | None,
+    vad_cache_enabled: bool,
+):
+    global _VAD_SEGMENTS_BY_KEY, _VAD_CACHE_ENABLED, _VAD_MISSING_WARNED_KEYS
+    _init_worker(processed_chunk_ids, cache_hit, cache_miss, cache_lock)
+    _VAD_SEGMENTS_BY_KEY = vad_segments_by_key or {}
+    _VAD_CACHE_ENABLED = bool(vad_cache_enabled)
+    _VAD_MISSING_WARNED_KEYS = set()
+
+
 def main():
     args = parse_args()
     hf_token = os.environ.get("HF_TOKEN")
@@ -529,6 +623,9 @@ def main():
     features_path = os.path.join(args.out_dir, "manifest_features.jsonl")
     processed = load_processed_chunk_ids(features_path) if args.resume else set()
     errors_path = os.path.join(args.out_dir, "errors.jsonl")
+    vad_segments_by_key = {}
+    if args.vad_segments_cache:
+        vad_segments_by_key = load_vad_segments_cache(args.vad_segments_cache)
 
     entries_to_process = []
     for entry in entries:
@@ -539,6 +636,10 @@ def main():
 
     remaining_count = len(entries_to_process)
     processed_loaded = len(processed)
+    entry_keys = {str(get_value(entry, ["vad_key", "key", "__key__"])) for entry in entries_to_process}
+    vad_keys_missing = 0
+    if args.vad_segments_cache:
+        vad_keys_missing = len([k for k in entry_keys if k not in vad_segments_by_key])
 
     print(f"manifest_path: {args.manifest_path}", flush=True)
     print(f"out_dir: {args.out_dir}", flush=True)
@@ -552,6 +653,12 @@ def main():
     print(f"segment_mode_detected: {segment_mode}", flush=True)
     print(f"timeout_sec: {args.timeout_sec}", flush=True)
     print(f"tar_cache_dir: {args.tar_cache_dir} cache_hit=0 cache_miss=0", flush=True)
+    if args.vad_segments_cache:
+        print(
+            f"vad_segments_cache: {args.vad_segments_cache} "
+            f"keys_loaded={len(vad_segments_by_key)} vad_keys_missing={vad_keys_missing}",
+            flush=True,
+        )
 
     shard_idx = next_shard_index(shards_dir)
     buffer = []
@@ -614,7 +721,14 @@ def main():
 
     if args.num_workers <= 1:
         print("running in SEQUENTIAL mode", flush=True)
-        _init_worker(processed, None, None, None)
+        _init_worker_with_vad(
+            processed,
+            None,
+            None,
+            None,
+            vad_segments_by_key,
+            bool(args.vad_segments_cache),
+        )
         for idx, entry in enumerate(entries_to_process, start=1):
             attempted += 1
             try:
@@ -729,8 +843,15 @@ def main():
                 with futures.ProcessPoolExecutor(
                     max_workers=args.num_workers,
                     mp_context=spawn_ctx,
-                    initializer=_init_worker,
-                    initargs=(processed, cache_hit, cache_miss, cache_lock),
+                    initializer=_init_worker_with_vad,
+                    initargs=(
+                        processed,
+                        cache_hit,
+                        cache_miss,
+                        cache_lock,
+                        vad_segments_by_key,
+                        bool(args.vad_segments_cache),
+                    ),
                 ) as executor:
                     future_to_entry = {}
                     batch_remaining_set = {id(entry) for entry in batch_remaining}
@@ -932,6 +1053,7 @@ def main():
         "elapsed_sec": elapsed,
         "chunks_emitted": chunk_total,
         "attempted": attempted,
+        "vad_keys_missing": vad_keys_missing,
     }
     stats_path = os.path.join(args.out_dir, "stats.json")
     with open(stats_path, "w") as f:

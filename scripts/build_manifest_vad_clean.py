@@ -7,6 +7,10 @@ Example:
 
 Progress logging prints every N seen entries (default: 50,000).
 """
+# Debugging map of where true segment boundaries come from:
+# Segments source: https://huggingface.co/datasets/MLCommons/unsupervised_peoples_speech/resolve/main/vad_results.jsonl
+# Format: JSONL, each line is a dict like {"vad_key": {"timestamps": [{"start": <sample_idx>, "end": <sample_idx>}], ...}}
+# Lookup key: vad_key -> top-level key in each JSON object line (e.g. "ME1221AM/ME1221AM")
 
 import argparse
 import json
@@ -244,6 +248,52 @@ def build_manifest(args):
     print(f"Manifest: {manifest_path}")
     print(f"Stats: {stats_path}")
     return 0
+
+
+def debug_show_segments(vad_key: str, hf_token: str | None = None, timeout: int = 60) -> int:
+    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+    try:
+        resp = requests.get(VAD_URL, headers=headers, stream=True, timeout=timeout)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(f"failed to download VAD JSONL: {exc}") from exc
+
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict) or vad_key not in obj:
+            continue
+
+        payload = obj.get(vad_key) or {}
+        timestamps = payload.get("timestamps") if isinstance(payload, dict) else None
+        if not isinstance(timestamps, list):
+            raise RuntimeError(f"vad_key {vad_key} found but has no valid timestamps list")
+
+        print(f"vad_key: {vad_key}")
+        print(f"segment_count: {len(timestamps)}")
+        print("first_5_segments_sec:")
+        for idx, seg in enumerate(timestamps[:5]):
+            if not isinstance(seg, dict):
+                continue
+            start = int(seg.get("start", 0))
+            end = int(seg.get("end", 0))
+            print(f"  {idx}: start_sec={start / SAMPLE_RATE:.3f}, end_sec={end / SAMPLE_RATE:.3f}")
+
+        total_speech_samples = 0
+        for seg in timestamps:
+            if not isinstance(seg, dict):
+                continue
+            start = int(seg.get("start", 0))
+            end = int(seg.get("end", 0))
+            total_speech_samples += max(0, end - start)
+        print(f"total_speech_sec_from_segments: {total_speech_samples / SAMPLE_RATE:.3f}")
+        return 0
+
+    raise RuntimeError(f"vad_key not found in VAD stream: {vad_key}")
 
 
 def main():
