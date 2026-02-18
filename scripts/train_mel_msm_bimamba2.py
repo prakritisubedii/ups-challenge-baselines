@@ -443,6 +443,7 @@ def main():
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         current_lr = compute_lr(
             step=step,
