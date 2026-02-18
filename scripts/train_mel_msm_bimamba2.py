@@ -405,6 +405,8 @@ def main():
         if batch is None:
             if step % args.log_every == 0:
                 print(f"Step {step}: skipped (empty batch)", flush=True)
+            if step % args.ckpt_every == 0:
+                save_checkpoint(args.save_dir, step, model, optimizer, cfg)
             continue
 
         x, pad_mask, _lengths, kept_samples = batch
