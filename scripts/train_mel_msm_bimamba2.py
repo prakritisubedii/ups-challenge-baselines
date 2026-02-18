@@ -49,7 +49,7 @@ def parse_args():
     parser.add_argument("--mask_ratio", type=float, default=0.30)
     parser.add_argument("--num_steps", type=int, default=2000)
     parser.add_argument("--log_every", type=int, default=10)
-    parser.add_argument("--ckpt_every", type=int, default=500)
+    parser.add_argument("--ckpt_every", type=int, default=1000)
     parser.add_argument("--val_shards", type=int, default=5)
     parser.add_argument("--val_every", type=int, default=200)
     parser.add_argument("--val_batches", type=int, default=5)
