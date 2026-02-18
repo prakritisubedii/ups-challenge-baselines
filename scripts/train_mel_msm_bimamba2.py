@@ -412,8 +412,21 @@ def main():
         pad_mask = pad_mask.to(device, non_blocking=True)
 
         x_masked, valid_mask = apply_time_mask(x, pad_mask, args.mask_ratio, rng)
+        x_masked = torch.clamp(x_masked, min=-20.0, max=20.0)
         hidden = model.backbone(model.proj_in(x_masked))
+        hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
         pred = model.proj_out(hidden)
+        if torch.isnan(pred).any() or torch.isnan(hidden).any():
+            kept_lids = [
+                str(sample.get("lid"))
+                for sample in kept_samples
+                if isinstance(sample, dict) and sample.get("lid") is not None
+            ]
+            print(
+                f"WARNING: NaN detected at step {step}; skipping batch. batch_lids={kept_lids}",
+                flush=True,
+            )
+            continue
         msm_loss = F.mse_loss(pred[valid_mask], x[valid_mask])
 
         lid_ce_loss = torch.tensor(0.0, device=device)
