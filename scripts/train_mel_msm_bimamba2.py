@@ -18,6 +18,7 @@ os.environ["TORCH_COMPILE_DISABLE"] = "1"
 import argparse
 import glob
 import json
+import math
 import random
 import time
 from collections import Counter, OrderedDict
@@ -43,6 +44,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--warmup_steps", type=int, default=5000)
+    parser.add_argument("--lr_decay", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mask_ratio", type=float, default=0.30)
     parser.add_argument("--num_steps", type=int, default=2000)
     parser.add_argument("--log_every", type=int, default=10)
@@ -54,6 +57,7 @@ def parse_args():
     parser.add_argument("--sampling_mode", type=str, default="natural", choices=["natural", "balanced", "hybrid"])
     parser.add_argument("--hybrid_balanced_frac", type=float, default=0.30)
     parser.add_argument("--lid_cache_path", type=str, default="")
+    parser.add_argument("--lid_loss_weight", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--shuffle_shards", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shuffle_within_shard", action=argparse.BooleanOptionalAction, default=True)
@@ -72,6 +76,7 @@ class BiMambaMSM(torch.nn.Module):
             use_mem_eff_path=False,
         )
         self.proj_out = torch.nn.Linear(d_model, 80)
+        self.lid_head = None
 
     def forward(self, x):
         x = self.proj_in(x)
@@ -153,6 +158,7 @@ def build_lid_index(shard_files: list[str]):
 
 def make_batch(samples: list[dict]):
     mels = []
+    kept_samples = []
     for sample in samples:
         mel = sample.get("mel") if isinstance(sample, dict) else None
         if mel is None or not isinstance(mel, torch.Tensor):
@@ -160,6 +166,7 @@ def make_batch(samples: list[dict]):
         if mel.ndim != 2 or mel.shape[0] != 80 or mel.shape[1] < 1:
             continue
         mels.append(mel.float().cpu())
+        kept_samples.append(sample)
     if not mels:
         return None
     seqs = [s.t().contiguous() for s in mels]  # [T, 80]
@@ -173,7 +180,7 @@ def make_batch(samples: list[dict]):
         cur_len = seq.shape[0]
         x[i, :cur_len] = seq
         pad_mask[i, :cur_len] = True
-    return x, pad_mask, torch.tensor(lengths, dtype=torch.long)
+    return x, pad_mask, torch.tensor(lengths, dtype=torch.long), kept_samples
 
 
 def apply_time_mask(x: torch.Tensor, pad_mask: torch.Tensor, mask_ratio: float, rng: torch.Generator):
@@ -196,9 +203,25 @@ def apply_time_mask(x: torch.Tensor, pad_mask: torch.Tensor, mask_ratio: float, 
 class TrainLog:
     step: int
     loss: float
+    lid_loss: float
+    lr: float
     val_loss: Optional[float]
     elapsed_sec: float
     batch_lid_counts: dict
+
+
+def compute_lr(step: int, num_steps: int, base_lr: float, warmup_steps: int, lr_decay: bool) -> float:
+    warmup_steps = max(1, warmup_steps)
+    if step <= warmup_steps:
+        return base_lr * (step / warmup_steps)
+    if not lr_decay:
+        return base_lr
+
+    min_lr = base_lr * 0.1
+    decay_steps = max(1, num_steps - warmup_steps)
+    progress = min(1.0, max(0.0, (step - warmup_steps) / decay_steps))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + (base_lr - min_lr) * cosine
 
 
 def save_checkpoint(save_dir: str, step: int, model: torch.nn.Module, optimizer: torch.optim.Optimizer, cfg: dict):
@@ -254,7 +277,7 @@ def run_val(
         batch = make_batch(examples)
         if batch is None:
             continue
-        x, pad_mask, _lengths = batch
+        x, pad_mask, _lengths, _kept_samples = batch
         x = x.to(device, non_blocking=True)
         pad_mask = pad_mask.to(device, non_blocking=True)
 
@@ -275,7 +298,7 @@ def run_val(
 def main():
     args = parse_args()
     shard_dir = os.path.join(args.precompute_dir, "shards")
-    shard_files = sorted(glob.glob(os.path.join(shard_dir, "shard-*.pt")))
+    shard_files = sorted(glob.glob(os.path.join(shard_dir, "*.pt")))
     if not shard_files:
         raise ValueError(f"No shard-*.pt files found in {shard_dir}")
 
@@ -318,9 +341,25 @@ def main():
     model = BiMambaMSM(d_model=args.d_model).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
+    lid_index = load_lid_index(args.lid_cache_path, train_shard_files)
+    if lid_index is None:
+        lid_index = build_lid_index(train_shard_files)
+        if args.lid_cache_path:
+            os.makedirs(os.path.dirname(args.lid_cache_path) or ".", exist_ok=True)
+            with open(args.lid_cache_path, "w") as f:
+                json.dump(lid_index, f)
+
+    lid2idx = {}
+    if lid_index:
+        lid_ids = sorted(set(lid_index.keys()))
+        lid2idx = {lid: idx for idx, lid in enumerate(lid_ids)}
+        if lid2idx:
+            model.lid_head = torch.nn.Linear(args.d_model, len(lid2idx)).to(device)
+            optimizer.add_param_group({"params": model.lid_head.parameters(), "lr": args.lr})
+
     if args.resume_from:
         ckpt = torch.load(args.resume_from, map_location=device)
-        model.load_state_dict(ckpt.get("model_state", {}))
+        model.load_state_dict(ckpt.get("model_state", {}), strict=False)
         optimizer.load_state_dict(ckpt.get("optimizer_state", {}))
         start_step = int(ckpt.get("step", 0))
         print(f"Resumed from {args.resume_from} at step {start_step}", flush=True)
@@ -334,15 +373,6 @@ def main():
         seed=args.seed,
     )
     sampling_rng = random.Random(args.seed + 7)
-    lid_index = None
-    if args.sampling_mode != "natural":
-        lid_index = load_lid_index(args.lid_cache_path, train_shard_files)
-        if lid_index is None:
-            lid_index = build_lid_index(train_shard_files)
-            if args.lid_cache_path:
-                os.makedirs(os.path.dirname(args.lid_cache_path) or ".", exist_ok=True)
-                with open(args.lid_cache_path, "w") as f:
-                    json.dump(lid_index, f)
     lid_cache = ShardLRUCache(max_items=3)
     lid_keys = list(lid_index.keys()) if lid_index else []
 
@@ -377,19 +407,56 @@ def main():
                 print(f"Step {step}: skipped (empty batch)", flush=True)
             continue
 
-        x, pad_mask, _lengths = batch
+        x, pad_mask, _lengths, kept_samples = batch
         x = x.to(device, non_blocking=True)
         pad_mask = pad_mask.to(device, non_blocking=True)
 
         x_masked, valid_mask = apply_time_mask(x, pad_mask, args.mask_ratio, rng)
-        pred = model(x_masked)
-        loss = F.mse_loss(pred[valid_mask], x[valid_mask])
+        hidden = model.backbone(model.proj_in(x_masked))
+        pred = model.proj_out(hidden)
+        msm_loss = F.mse_loss(pred[valid_mask], x[valid_mask])
+
+        lid_ce_loss = torch.tensor(0.0, device=device)
+        if model.lid_head is not None and kept_samples:
+            denom = pad_mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
+            pooled = (hidden * pad_mask.unsqueeze(-1).to(hidden.dtype)).sum(dim=1) / denom
+            lid_logits = model.lid_head(pooled)
+            valid_rows = []
+            lid_targets = []
+            for i, sample in enumerate(kept_samples):
+                if not isinstance(sample, dict):
+                    continue
+                lid = sample.get("lid")
+                if lid is None:
+                    continue
+                lid_idx = lid2idx.get(str(lid))
+                if lid_idx is None:
+                    continue
+                valid_rows.append(i)
+                lid_targets.append(lid_idx)
+            if valid_rows:
+                row_idx = torch.tensor(valid_rows, device=device, dtype=torch.long)
+                target = torch.tensor(lid_targets, device=device, dtype=torch.long)
+                lid_ce_loss = F.cross_entropy(lid_logits.index_select(0, row_idx), target)
+
+        loss = msm_loss + (args.lid_loss_weight * lid_ce_loss)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+        current_lr = compute_lr(
+            step=step,
+            num_steps=args.num_steps,
+            base_lr=args.lr,
+            warmup_steps=args.warmup_steps,
+            lr_decay=args.lr_decay,
+        )
+        optimizer.param_groups[0]["lr"] = current_lr
+        for group in optimizer.param_groups[1:]:
+            group["lr"] = current_lr
 
         loss_val = float(loss.detach().cpu().item())
+        lid_loss_val = float(lid_ce_loss.detach().cpu().item())
         elapsed = time.time() - start_time
 
         batch_lid_counts = Counter()
@@ -415,6 +482,8 @@ def main():
             log_payload = {
                 "step": step,
                 "loss": loss_val,
+                "lid_loss": lid_loss_val,
+                "lr": current_lr,
                 "val_loss": val_loss,
                 "elapsed_sec": elapsed,
                 "batch_lid_counts": dict(batch_lid_counts),
@@ -426,6 +495,8 @@ def main():
         log_entry = TrainLog(
             step=step,
             loss=loss_val,
+            lid_loss=lid_loss_val,
+            lr=current_lr,
             val_loss=val_loss,
             elapsed_sec=elapsed,
             batch_lid_counts=dict(batch_lid_counts),
