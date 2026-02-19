@@ -235,6 +235,7 @@ def save_checkpoint(save_dir: str, step: int, model: torch.nn.Module, optimizer:
         },
         ckpt_path,
     )
+    return ckpt_path
 
 
 @torch.no_grad()
@@ -362,9 +363,11 @@ def main():
         model.load_state_dict(ckpt.get("model_state", {}), strict=False)
         optimizer.load_state_dict(ckpt.get("optimizer_state", {}))
         start_step = int(ckpt.get("step", 0))
+        last_good_ckpt_path = args.resume_from
         print(f"Resumed from {args.resume_from} at step {start_step}", flush=True)
     else:
         start_step = 0
+        last_good_ckpt_path = ""
 
     train_stream = sample_stream(
         shard_files=train_shard_files,
@@ -406,7 +409,7 @@ def main():
             if step % args.log_every == 0:
                 print(f"Step {step}: skipped (empty batch)", flush=True)
             if step % args.ckpt_every == 0:
-                save_checkpoint(args.save_dir, step, model, optimizer, cfg)
+                last_good_ckpt_path = save_checkpoint(args.save_dir, step, model, optimizer, cfg)
             continue
 
         x, pad_mask, _lengths, kept_samples = batch
@@ -415,6 +418,9 @@ def main():
 
         x_masked, valid_mask = apply_time_mask(x, pad_mask, args.mask_ratio, rng)
         x_masked = torch.clamp(x_masked, min=-20.0, max=20.0)
+        if torch.isnan(x_masked).any():
+            print(f"WARNING: NaN detected in x_masked at step {step}; skipping batch.", flush=True)
+            continue
         hidden = model.backbone(model.proj_in(x_masked))
         hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
         pred = model.proj_out(hidden)
@@ -428,6 +434,11 @@ def main():
                 f"WARNING: NaN detected at step {step}; skipping batch. batch_lids={kept_lids}",
                 flush=True,
             )
+            if last_good_ckpt_path:
+                restore_ckpt = torch.load(last_good_ckpt_path, map_location=device)
+                model.load_state_dict(restore_ckpt.get("model_state", {}), strict=False)
+                optimizer.load_state_dict(restore_ckpt.get("optimizer_state", {}))
+                print("Restored from last good checkpoint", flush=True)
             continue
         msm_loss = F.mse_loss(pred[valid_mask], x[valid_mask])
 
@@ -521,9 +532,9 @@ def main():
             f.write(json.dumps(asdict(log_entry)) + "\n")
 
         if step % args.ckpt_every == 0:
-            save_checkpoint(args.save_dir, step, model, optimizer, cfg)
+            last_good_ckpt_path = save_checkpoint(args.save_dir, step, model, optimizer, cfg)
 
-    save_checkpoint(args.save_dir, args.num_steps, model, optimizer, cfg)
+    last_good_ckpt_path = save_checkpoint(args.save_dir, args.num_steps, model, optimizer, cfg)
 
 
 if __name__ == "__main__":
