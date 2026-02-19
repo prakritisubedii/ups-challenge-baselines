@@ -70,8 +70,8 @@ class BiMambaMSM(torch.nn.Module):
         self.proj_in = torch.nn.Linear(80, d_model)
         self.backbone = BiMamba2(
             d_model=d_model,
-            d_state=16,
-            d_conv=4,
+            d_state=64,
+            d_conv=7,
             expand=2,
             use_mem_eff_path=False,
         )
