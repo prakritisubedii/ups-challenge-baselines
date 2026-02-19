@@ -373,7 +373,7 @@ def main():
         seed=args.seed,
     )
     sampling_rng = random.Random(args.seed + 7)
-    lid_cache = ShardLRUCache(max_items=3)
+    lid_cache = ShardLRUCache(max_items=500)
     lid_keys = list(lid_index.keys()) if lid_index else []
 
     log_path = os.path.join(args.save_dir, "train_log.jsonl")
