@@ -82,14 +82,7 @@ class BiMambaMSM(torch.nn.Module):
     def forward(self, x):
         x = self.proj_in(x)
         x = self.input_norm(x)
-        T = x.shape[1]
-        chunk_size = 256
-        pad_len = (chunk_size - T % chunk_size) % chunk_size
-        if pad_len > 0:
-            x = torch.nn.functional.pad(x, (0, 0, 0, pad_len))
         x = self.backbone(x)
-        if pad_len > 0:
-            x = x[:, :T, :]
         return self.proj_out(x)
 
 
