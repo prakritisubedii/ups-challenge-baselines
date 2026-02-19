@@ -363,7 +363,10 @@ def main():
     if args.resume_from:
         ckpt = torch.load(args.resume_from, map_location=device)
         model.load_state_dict(ckpt.get("model_state", {}), strict=False)
-        optimizer.load_state_dict(ckpt.get("optimizer_state", {}))
+        try:
+            optimizer.load_state_dict(ckpt.get("optimizer_state", {}))
+        except (ValueError, KeyError):
+            print("Warning: optimizer state not loaded (parameter group mismatch), starting optimizer fresh.")
         start_step = int(ckpt.get("step", 0))
         last_good_ckpt_path = args.resume_from
         print(f"Resumed from {args.resume_from} at step {start_step}", flush=True)
