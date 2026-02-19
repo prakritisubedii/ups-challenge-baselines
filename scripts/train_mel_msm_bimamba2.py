@@ -75,12 +75,13 @@ class BiMambaMSM(torch.nn.Module):
             expand=2,
             use_mem_eff_path=False,
         )
+        self.input_norm = torch.nn.LayerNorm(d_model)
         self.proj_out = torch.nn.Linear(d_model, 80)
         self.lid_head = None
 
     def forward(self, x):
         x = self.proj_in(x)
-        x = self.backbone(x)
+        x = self.backbone(self.input_norm(x))
         return self.proj_out(x)
 
 
