@@ -388,6 +388,7 @@ def main():
     start_time = time.time()
     rng = torch.Generator(device=device)
     rng.manual_seed(args.seed)
+    effective_lid_weight = args.lid_loss_weight
 
     for step in range(start_step + 1, args.num_steps + 1):
         examples = []
@@ -470,12 +471,18 @@ def main():
                 target = torch.tensor(lid_targets, device=device, dtype=torch.long)
                 lid_ce_loss = F.cross_entropy(lid_logits.index_select(0, row_idx), target)
 
-        loss = msm_loss + (args.lid_loss_weight * lid_ce_loss)
+        loss = msm_loss + (effective_lid_weight * lid_ce_loss)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        # Decay lid_loss_weight linearly from args.lid_loss_weight to args.lid_loss_weight * 0.1
+        # between start_step and start_step + 50000.
+        lid_decay_start = start_step
+        lid_decay_steps = 50000
+        progress = max(0.0, min(1.0, (step - lid_decay_start) / lid_decay_steps))
+        effective_lid_weight = args.lid_loss_weight * (1.0 - 0.9 * progress)
         current_lr = compute_lr(
             step=step,
             num_steps=args.num_steps,
