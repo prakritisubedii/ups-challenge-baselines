@@ -358,7 +358,7 @@ def main():
         lid2idx = {lid: idx for idx, lid in enumerate(lid_ids)}
         if lid2idx:
             model.lid_head = torch.nn.Linear(args.d_model, len(lid2idx)).to(device)
-            optimizer.add_param_group({"params": model.lid_head.parameters(), "lr": args.lr})
+            optimizer.add_param_group({"params": model.lid_head.parameters(), "lr": args.lr * 20})
 
     if args.resume_from:
         ckpt = torch.load(args.resume_from, map_location=device)
