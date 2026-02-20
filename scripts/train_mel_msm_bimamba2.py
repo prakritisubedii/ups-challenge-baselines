@@ -477,7 +477,9 @@ def main():
         # VICReg: mean-pool hidden states for embedding regularization
         denom_v = pad_mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
         z_pooled = (hidden * pad_mask.unsqueeze(-1).to(hidden.dtype)).sum(dim=1) / denom_v
-        z_vicreg = F.normalize(z_pooled, dim=-1)
+        z_pooled = z_pooled.clamp(-100.0, 100.0)
+        z_norm = z_pooled.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        z_vicreg = z_pooled / z_norm
         var_loss, cov_loss = vicreg_loss(z_vicreg)
         cov_loss = cov_loss.clamp(max=10.0)
         vicreg = var_loss + 0.04 * cov_loss
