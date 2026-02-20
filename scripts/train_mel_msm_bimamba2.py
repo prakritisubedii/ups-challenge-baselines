@@ -81,6 +81,7 @@ class BiMambaMSM(torch.nn.Module):
             nn.LayerNorm(d_model)
             for _ in range(num_layers)
         ])
+        self.final_norm = nn.LayerNorm(d_model)
         self.input_norm = torch.nn.LayerNorm(d_model)
         self.proj_out = torch.nn.Linear(d_model, 80)
         self.lid_head = None
@@ -88,7 +89,11 @@ class BiMambaMSM(torch.nn.Module):
     def forward(self, x):
         x = self.proj_in(x)
         for layer, norm in zip(self.backbone, self.layer_norms):
-            x = norm(layer(x))
+            residual = x
+            x = norm(x)
+            x = layer(x)
+            x = x + residual.to(x.dtype)
+        x = self.final_norm(x)
         hidden = x
         pred = self.proj_out(hidden)
         return pred, hidden
