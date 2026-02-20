@@ -524,8 +524,15 @@ def main():
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
         optimizer.step()
+        # Clamp SSM parameters to prevent selective scan overflow
+        with torch.no_grad():
+            for module in model.modules():
+                if hasattr(module, 'A_log'):
+                    module.A_log.clamp_(-10.0, 2.0)
+                if hasattr(module, 'dt_bias'):
+                    module.dt_bias.clamp_(-5.0, 5.0)
         # Decay lid_loss_weight linearly from args.lid_loss_weight to args.lid_loss_weight * 0.1
         # between start_step and start_step + 50000.
         lid_decay_start = start_step
