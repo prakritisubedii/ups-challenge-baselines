@@ -473,6 +473,14 @@ def main():
             print(f"WARNING: NaN detected in x_masked at step {step}; skipping batch.", flush=True)
             continue
         pred, hidden = model(x_masked)
+        if torch.isnan(pred).any() or torch.isinf(pred).any():
+            print(f"WARNING: NaN/Inf in pred at step {step}; skipping batch.", flush=True)
+            if last_good_ckpt_path:
+                restore_ckpt = torch.load(last_good_ckpt_path, map_location=device)
+                model.load_state_dict(restore_ckpt["model_state"])
+                optimizer.load_state_dict(restore_ckpt["optimizer_state"])
+                print("Restored from last good checkpoint", flush=True)
+            continue
         hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
         # VICReg: mean-pool hidden states for embedding regularization
         denom_v = pad_mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
@@ -499,6 +507,7 @@ def main():
                 optimizer.load_state_dict(restore_ckpt.get("optimizer_state", {}))
                 print("Restored from last good checkpoint", flush=True)
             continue
+        pred = pred.clamp(-50.0, 50.0)
         msm_loss = F.mse_loss(pred[valid_mask], x[valid_mask])
 
         lid_ce_loss = torch.tensor(0.0, device=device)
@@ -523,6 +532,15 @@ def main():
                 row_idx = torch.tensor(valid_rows, device=device, dtype=torch.long)
                 target = torch.tensor(lid_targets, device=device, dtype=torch.long)
                 lid_ce_loss = F.cross_entropy(lid_logits.index_select(0, row_idx), target)
+
+        if msm_loss.item() > 200:
+            print(f"WARNING: loss spike ({msm_loss.item():.1f}) at step {step}; skipping.", flush=True)
+            if last_good_ckpt_path:
+                restore_ckpt = torch.load(last_good_ckpt_path, map_location=device)
+                model.load_state_dict(restore_ckpt["model_state"])
+                optimizer.load_state_dict(restore_ckpt["optimizer_state"])
+                print("Restored from last good checkpoint", flush=True)
+            continue
 
         loss = msm_loss + (effective_lid_weight * lid_ce_loss) + (args.vicreg_weight * vicreg)
 
