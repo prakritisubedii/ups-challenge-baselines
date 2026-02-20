@@ -61,6 +61,7 @@ def parse_args():
     parser.add_argument("--vicreg_weight", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--min_lang_samples", type=int, default=20)
+    parser.add_argument("--max_en_frac", type=float, default=0.1)
     parser.add_argument("--shuffle_shards", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shuffle_within_shard", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
@@ -443,6 +444,12 @@ def main():
                     except Exception:
                         pass
             examples.append(next(train_stream))
+        # Cap English fraction in batch
+        if args.max_en_frac < 1.0:
+            en_samples = [s for s in examples if isinstance(s, dict) and str(s.get("lid","")) == "en"]
+            non_en = [s for s in examples if isinstance(s, dict) and str(s.get("lid","")) != "en"]
+            max_en = max(1, int(len(examples) * args.max_en_frac))
+            examples = non_en + en_samples[:max_en]
         batch = make_batch(examples)
         if batch is None:
             if step % args.log_every == 0:
