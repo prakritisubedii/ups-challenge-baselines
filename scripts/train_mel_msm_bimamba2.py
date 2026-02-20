@@ -60,6 +60,7 @@ def parse_args():
     parser.add_argument("--lid_loss_weight", type=float, default=0.1)
     parser.add_argument("--vicreg_weight", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--min_lang_samples", type=int, default=20)
     parser.add_argument("--shuffle_shards", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shuffle_within_shard", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
@@ -404,6 +405,16 @@ def main():
     )
     sampling_rng = random.Random(args.seed + 7)
     lid_cache = ShardLRUCache(max_items=500)
+    # Filter out languages below min_lang_samples threshold
+    if lid_index and args.min_lang_samples > 0:
+        before = len(lid_index)
+        lid_index = {k: v for k, v in lid_index.items() if len(v) >= args.min_lang_samples}
+        dropped = before - len(lid_index)
+        if dropped:
+            print(
+                f"Filtered {dropped} languages with <{args.min_lang_samples} samples. Keeping {len(lid_index)} languages.",
+                flush=True,
+            )
     lid_keys = list(lid_index.keys()) if lid_index else []
 
     log_path = os.path.join(args.save_dir, "train_log.jsonl")
