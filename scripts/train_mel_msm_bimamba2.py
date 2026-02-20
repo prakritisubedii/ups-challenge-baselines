@@ -83,10 +83,11 @@ class BiMambaMSM(torch.nn.Module):
 
     def forward(self, x):
         x = self.proj_in(x)
-        x = self.input_norm(x)
         for layer in self.backbone:
             x = layer(x)
-        return self.proj_out(x)
+        hidden = x
+        pred = self.proj_out(hidden)
+        return pred, hidden
 
 
 def sample_stream(shard_files: list[str], shuffle: bool, shuffle_within_shard: bool, seed: int):
@@ -467,14 +468,13 @@ def main():
         if torch.isnan(x_masked).any():
             print(f"WARNING: NaN detected in x_masked at step {step}; skipping batch.", flush=True)
             continue
-        hidden = model.backbone(model.input_norm(model.proj_in(x_masked)))
+        pred, hidden = model(x_masked)
         hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
         # VICReg: mean-pool hidden states for embedding regularization
         denom_v = pad_mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
         z_pooled = (hidden * pad_mask.unsqueeze(-1).to(hidden.dtype)).sum(dim=1) / denom_v
         var_loss, cov_loss = vicreg_loss(z_pooled)
         vicreg = var_loss + 0.04 * cov_loss
-        pred = model.proj_out(hidden)
         if torch.isnan(pred).any() or torch.isnan(hidden).any():
             kept_lids = [
                 str(sample.get("lid"))
