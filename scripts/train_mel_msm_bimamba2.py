@@ -77,14 +77,18 @@ class BiMambaMSM(torch.nn.Module):
             BiMamba2(d_model=d_model, d_state=64, d_conv=7, expand=2, use_mem_eff_path=False)
             for _ in range(num_layers)
         ])
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(d_model)
+            for _ in range(num_layers)
+        ])
         self.input_norm = torch.nn.LayerNorm(d_model)
         self.proj_out = torch.nn.Linear(d_model, 80)
         self.lid_head = None
 
     def forward(self, x):
         x = self.proj_in(x)
-        for layer in self.backbone:
-            x = layer(x)
+        for layer, norm in zip(self.backbone, self.layer_norms):
+            x = norm(layer(x))
         hidden = x
         pred = self.proj_out(hidden)
         return pred, hidden
