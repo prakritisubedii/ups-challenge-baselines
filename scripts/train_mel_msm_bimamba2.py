@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass
 from typing import Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 try:
@@ -43,6 +44,7 @@ def parse_args():
     parser.add_argument("--save_dir", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--d_model", type=int, default=128)
+    parser.add_argument("--num_layers", type=int, default=6)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--warmup_steps", type=int, default=5000)
     parser.add_argument("--lr_decay", action=argparse.BooleanOptionalAction, default=True)
@@ -68,16 +70,13 @@ def parse_args():
 
 
 class BiMambaMSM(torch.nn.Module):
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, num_layers: int):
         super().__init__()
         self.proj_in = torch.nn.Linear(80, d_model)
-        self.backbone = BiMamba2(
-            d_model=d_model,
-            d_state=64,
-            d_conv=7,
-            expand=2,
-            use_mem_eff_path=False,
-        )
+        self.backbone = nn.ModuleList([
+            BiMamba2(d_model=d_model, d_state=64, d_conv=7, expand=2, use_mem_eff_path=False)
+            for _ in range(num_layers)
+        ])
         self.input_norm = torch.nn.LayerNorm(d_model)
         self.proj_out = torch.nn.Linear(d_model, 80)
         self.lid_head = None
@@ -85,7 +84,8 @@ class BiMambaMSM(torch.nn.Module):
     def forward(self, x):
         x = self.proj_in(x)
         x = self.input_norm(x)
-        x = self.backbone(x)
+        for layer in self.backbone:
+            x = layer(x)
         return self.proj_out(x)
 
 
@@ -365,7 +365,7 @@ def main():
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)
 
-    model = BiMambaMSM(d_model=args.d_model).to(device)
+    model = BiMambaMSM(d_model=args.d_model, num_layers=args.num_layers).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     lid_index = load_lid_index(args.lid_cache_path, train_shard_files)
