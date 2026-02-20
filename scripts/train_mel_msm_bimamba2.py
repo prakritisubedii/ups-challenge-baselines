@@ -427,7 +427,7 @@ def main():
         if torch.isnan(x_masked).any():
             print(f"WARNING: NaN detected in x_masked at step {step}; skipping batch.", flush=True)
             continue
-        hidden = model.backbone(model.proj_in(x_masked))
+        hidden = model.backbone(model.input_norm(model.proj_in(x_masked)))
         hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
         pred = model.proj_out(hidden)
         if torch.isnan(pred).any() or torch.isnan(hidden).any():
@@ -492,7 +492,7 @@ def main():
         )
         optimizer.param_groups[0]["lr"] = current_lr
         for group in optimizer.param_groups[1:]:
-            group["lr"] = current_lr
+            group["lr"] = current_lr * 20
 
         loss_val = float(loss.detach().cpu().item())
         lid_loss_val = float(lid_ce_loss.detach().cpu().item())
