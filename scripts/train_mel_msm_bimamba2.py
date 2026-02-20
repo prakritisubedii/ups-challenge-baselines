@@ -58,6 +58,7 @@ def parse_args():
     parser.add_argument("--hybrid_balanced_frac", type=float, default=0.30)
     parser.add_argument("--lid_cache_path", type=str, default="")
     parser.add_argument("--lid_loss_weight", type=float, default=0.1)
+    parser.add_argument("--vicreg_weight", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--shuffle_shards", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shuffle_within_shard", action=argparse.BooleanOptionalAction, default=True)
@@ -199,6 +200,27 @@ def apply_time_mask(x: torch.Tensor, pad_mask: torch.Tensor, mask_ratio: float, 
     x_masked = x.clone()
     x_masked[valid_mask] = 0.0
     return x_masked, valid_mask
+
+
+def vicreg_loss(z: torch.Tensor, gamma: float = 1.0, epsilon: float = 1e-4):
+    """Variance + Covariance regularization on batch embeddings.
+    Prevents dimensional collapse without requiring augmentation pairs.
+    Args:
+        z: [B, D] mean-pooled embeddings (raw, not normalized)
+        gamma: target minimum std per dimension
+    Returns:
+        var_loss, cov_loss (both scalar tensors)
+    """
+    B, D = z.shape
+    z = z - z.mean(dim=0)  # center
+    # Variance: hinge to keep each dim's std above gamma
+    std = torch.sqrt(z.var(dim=0) + epsilon)
+    var_loss = torch.mean(F.relu(gamma - std))
+    # Covariance: penalize off-diagonal entries
+    cov = (z.T @ z) / (B - 1)
+    off_diag = cov * (1 - torch.eye(D, device=z.device))
+    cov_loss = off_diag.pow(2).sum() / D
+    return var_loss, cov_loss
 
 
 @dataclass
@@ -429,6 +451,11 @@ def main():
             continue
         hidden = model.backbone(model.input_norm(model.proj_in(x_masked)))
         hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
+        # VICReg: mean-pool hidden states for embedding regularization
+        denom_v = pad_mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
+        z_pooled = (hidden * pad_mask.unsqueeze(-1).to(hidden.dtype)).sum(dim=1) / denom_v
+        var_loss, cov_loss = vicreg_loss(z_pooled)
+        vicreg = var_loss + 0.04 * cov_loss
         pred = model.proj_out(hidden)
         if torch.isnan(pred).any() or torch.isnan(hidden).any():
             kept_lids = [
@@ -471,7 +498,7 @@ def main():
                 target = torch.tensor(lid_targets, device=device, dtype=torch.long)
                 lid_ce_loss = F.cross_entropy(lid_logits.index_select(0, row_idx), target)
 
-        loss = msm_loss + (effective_lid_weight * lid_ce_loss)
+        loss = msm_loss + (effective_lid_weight * lid_ce_loss) + (args.vicreg_weight * vicreg)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -522,6 +549,8 @@ def main():
                 "step": step,
                 "loss": loss_val,
                 "lid_loss": lid_loss_val,
+                "var_loss": float(var_loss.detach().cpu().item()),
+                "cov_loss": float(cov_loss.detach().cpu().item()),
                 "lr": current_lr,
                 "val_loss": val_loss,
                 "elapsed_sec": elapsed,
