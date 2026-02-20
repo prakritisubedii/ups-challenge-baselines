@@ -74,7 +74,7 @@ class BiMambaMSM(torch.nn.Module):
         super().__init__()
         self.proj_in = torch.nn.Linear(80, d_model)
         self.backbone = nn.ModuleList([
-            BiMamba2(d_model=d_model, d_state=64, d_conv=7, expand=2, use_mem_eff_path=False)
+            BiMamba2(d_model=d_model, d_state=16, d_conv=7, expand=2, use_mem_eff_path=False)
             for _ in range(num_layers)
         ])
         self.layer_norms = nn.ModuleList([
@@ -260,12 +260,20 @@ def compute_lr(step: int, num_steps: int, base_lr: float, warmup_steps: int, lr_
     return min_lr + (base_lr - min_lr) * cosine
 
 
-def save_checkpoint(save_dir: str, step: int, model: torch.nn.Module, optimizer: torch.optim.Optimizer, cfg: dict):
+def save_checkpoint(
+    save_dir: str,
+    step: int,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    cfg: dict,
+):
     ckpt_path = os.path.join(save_dir, f"ckpt_step_{step}.pt")
     torch.save(
         {
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
+            "scaler_state": scaler.state_dict(),
             "step": step,
             "cfg": cfg,
         },
@@ -276,9 +284,7 @@ def save_checkpoint(save_dir: str, step: int, model: torch.nn.Module, optimizer:
 
 @torch.no_grad()
 def run_val(
-    proj_in: torch.nn.Module,
-    backbone: torch.nn.Module,
-    proj_out: torch.nn.Module,
+    model: torch.nn.Module,
     val_shard_files: list[str],
     batch_size: int,
     mask_ratio: float,
@@ -292,9 +298,7 @@ def run_val(
     if freq != 80:
         raise ValueError(f"Expected freq=80, got {freq}")
 
-    proj_in.eval()
-    backbone.eval()
-    proj_out.eval()
+    model.eval()
 
     stream = sample_stream(
         shard_files=val_shard_files,
@@ -319,13 +323,12 @@ def run_val(
         pad_mask = pad_mask.to(device, non_blocking=True)
 
         x_masked, valid_mask = apply_time_mask(x, pad_mask, mask_ratio, rng)
-        pred = proj_out(backbone(proj_in(x_masked)))
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            pred, _ = model(x_masked)
         loss = F.mse_loss(pred[valid_mask], x[valid_mask])
         losses.append(float(loss.detach().cpu().item()))
 
-    proj_in.train()
-    backbone.train()
-    proj_out.train()
+    model.train()
 
     if not losses:
         return None
@@ -377,6 +380,7 @@ def main():
 
     model = BiMambaMSM(d_model=args.d_model, num_layers=args.num_layers).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    scaler = torch.amp.GradScaler("cuda")
 
     lid_index = load_lid_index(args.lid_cache_path, train_shard_files)
     if lid_index is None:
@@ -401,6 +405,10 @@ def main():
             optimizer.load_state_dict(ckpt.get("optimizer_state", {}))
         except (ValueError, KeyError):
             print("Warning: optimizer state not loaded (parameter group mismatch), starting optimizer fresh.")
+        try:
+            scaler.load_state_dict(ckpt["scaler_state"])
+        except (ValueError, KeyError):
+            pass
         start_step = int(ckpt.get("step", 0))
         last_good_ckpt_path = args.resume_from
         print(f"Resumed from {args.resume_from} at step {start_step}", flush=True)
@@ -465,7 +473,7 @@ def main():
             if step % args.log_every == 0:
                 print(f"Step {step}: skipped (empty batch)", flush=True)
             if step % args.ckpt_every == 0:
-                last_good_ckpt_path = save_checkpoint(args.save_dir, step, model, optimizer, cfg)
+                last_good_ckpt_path = save_checkpoint(args.save_dir, step, model, optimizer, scaler, cfg)
             continue
 
         x, pad_mask, _lengths, kept_samples = batch
@@ -477,82 +485,85 @@ def main():
         if torch.isnan(x_masked).any():
             print(f"WARNING: NaN detected in x_masked at step {step}; skipping batch.", flush=True)
             continue
-        pred, hidden = model(x_masked)
-        if torch.isnan(pred).any() or torch.isinf(pred).any():
-            print(f"WARNING: NaN/Inf in pred at step {step}; skipping batch.", flush=True)
-            if last_good_ckpt_path:
-                restore_ckpt = torch.load(last_good_ckpt_path, map_location=device)
-                model.load_state_dict(restore_ckpt["model_state"])
-                optimizer.load_state_dict(restore_ckpt["optimizer_state"])
-                print("Restored from last good checkpoint", flush=True)
-            continue
-        hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
-        # VICReg: mean-pool hidden states for embedding regularization
-        denom_v = pad_mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
-        z_pooled = (hidden * pad_mask.unsqueeze(-1).to(hidden.dtype)).sum(dim=1) / denom_v
-        z_pooled = z_pooled.clamp(-100.0, 100.0)
-        z_norm = z_pooled.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-        z_vicreg = z_pooled / z_norm
-        var_loss, cov_loss = vicreg_loss(z_vicreg)
-        cov_loss = cov_loss.clamp(max=10.0)
-        vicreg = var_loss + 0.04 * cov_loss
-        if torch.isnan(pred).any() or torch.isnan(hidden).any():
-            kept_lids = [
-                str(sample.get("lid"))
-                for sample in kept_samples
-                if isinstance(sample, dict) and sample.get("lid") is not None
-            ]
-            print(
-                f"WARNING: NaN detected at step {step}; skipping batch. batch_lids={kept_lids}",
-                flush=True,
-            )
-            if last_good_ckpt_path:
-                restore_ckpt = torch.load(last_good_ckpt_path, map_location=device)
-                model.load_state_dict(restore_ckpt.get("model_state", {}), strict=False)
-                optimizer.load_state_dict(restore_ckpt.get("optimizer_state", {}))
-                print("Restored from last good checkpoint", flush=True)
-            continue
-        pred = pred.clamp(-50.0, 50.0)
-        msm_loss = F.mse_loss(pred[valid_mask], x[valid_mask])
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            pred, hidden = model(x_masked)
+            hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
+            # VICReg: mean-pool hidden states for embedding regularization
+            denom_v = pad_mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
+            z_pooled = (hidden * pad_mask.unsqueeze(-1).to(hidden.dtype)).sum(dim=1) / denom_v
+            z_pooled = z_pooled.clamp(-100.0, 100.0)
+            z_norm = z_pooled.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            z_vicreg = z_pooled / z_norm
+            var_loss, cov_loss = vicreg_loss(z_vicreg)
+            cov_loss = cov_loss.clamp(max=10.0)
+            vicreg = var_loss + 0.04 * cov_loss
+            if torch.isnan(hidden).any():
+                kept_lids = [
+                    str(sample.get("lid"))
+                    for sample in kept_samples
+                    if isinstance(sample, dict) and sample.get("lid") is not None
+                ]
+                print(
+                    f"WARNING: NaN detected at step {step}; skipping batch. batch_lids={kept_lids}",
+                    flush=True,
+                )
+                if last_good_ckpt_path:
+                    restore_ckpt = torch.load(last_good_ckpt_path, map_location=device)
+                    model.load_state_dict(restore_ckpt.get("model_state", {}), strict=False)
+                    optimizer.load_state_dict(restore_ckpt.get("optimizer_state", {}))
+                    try:
+                        scaler.load_state_dict(restore_ckpt["scaler_state"])
+                    except (ValueError, KeyError):
+                        pass
+                    print("Restored from last good checkpoint", flush=True)
+                continue
+            pred = pred.clamp(-50.0, 50.0)
+            msm_loss = F.mse_loss(pred[valid_mask], x[valid_mask])
 
-        lid_ce_loss = torch.tensor(0.0, device=device)
-        if model.lid_head is not None and kept_samples:
-            denom = pad_mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
-            pooled = (hidden * pad_mask.unsqueeze(-1).to(hidden.dtype)).sum(dim=1) / denom
-            lid_logits = model.lid_head(pooled)
-            valid_rows = []
-            lid_targets = []
-            for i, sample in enumerate(kept_samples):
-                if not isinstance(sample, dict):
-                    continue
-                lid = sample.get("lid")
-                if lid is None:
-                    continue
-                lid_idx = lid2idx.get(str(lid))
-                if lid_idx is None:
-                    continue
-                valid_rows.append(i)
-                lid_targets.append(lid_idx)
-            if valid_rows:
-                row_idx = torch.tensor(valid_rows, device=device, dtype=torch.long)
-                target = torch.tensor(lid_targets, device=device, dtype=torch.long)
-                lid_ce_loss = F.cross_entropy(lid_logits.index_select(0, row_idx), target)
+            lid_ce_loss = torch.tensor(0.0, device=device)
+            if model.lid_head is not None and kept_samples:
+                denom = pad_mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
+                pooled = (hidden * pad_mask.unsqueeze(-1).to(hidden.dtype)).sum(dim=1) / denom
+                lid_logits = model.lid_head(pooled)
+                valid_rows = []
+                lid_targets = []
+                for i, sample in enumerate(kept_samples):
+                    if not isinstance(sample, dict):
+                        continue
+                    lid = sample.get("lid")
+                    if lid is None:
+                        continue
+                    lid_idx = lid2idx.get(str(lid))
+                    if lid_idx is None:
+                        continue
+                    valid_rows.append(i)
+                    lid_targets.append(lid_idx)
+                if valid_rows:
+                    row_idx = torch.tensor(valid_rows, device=device, dtype=torch.long)
+                    target = torch.tensor(lid_targets, device=device, dtype=torch.long)
+                    lid_ce_loss = F.cross_entropy(lid_logits.index_select(0, row_idx), target)
 
-        if msm_loss.item() > 200:
-            print(f"WARNING: loss spike ({msm_loss.item():.1f}) at step {step}; skipping.", flush=True)
-            if last_good_ckpt_path:
-                restore_ckpt = torch.load(last_good_ckpt_path, map_location=device)
-                model.load_state_dict(restore_ckpt["model_state"])
-                optimizer.load_state_dict(restore_ckpt["optimizer_state"])
-                print("Restored from last good checkpoint", flush=True)
-            continue
+            if msm_loss.item() > 200:
+                print(f"WARNING: loss spike ({msm_loss.item():.1f}) at step {step}; skipping.", flush=True)
+                if last_good_ckpt_path:
+                    restore_ckpt = torch.load(last_good_ckpt_path, map_location=device)
+                    model.load_state_dict(restore_ckpt["model_state"])
+                    optimizer.load_state_dict(restore_ckpt["optimizer_state"])
+                    try:
+                        scaler.load_state_dict(restore_ckpt["scaler_state"])
+                    except (ValueError, KeyError):
+                        pass
+                    print("Restored from last good checkpoint", flush=True)
+                continue
 
-        loss = msm_loss + (effective_lid_weight * lid_ce_loss) + (args.vicreg_weight * vicreg)
+            total_loss = msm_loss + (effective_lid_weight * lid_ce_loss) + (args.vicreg_weight * vicreg)
 
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-        optimizer.step()
+        scaler.scale(total_loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
         # Clamp SSM parameters to prevent selective scan overflow
         with torch.no_grad():
             for module in model.modules():
@@ -577,7 +588,7 @@ def main():
         for group in optimizer.param_groups[1:]:
             group["lr"] = current_lr * 20
 
-        loss_val = float(loss.detach().cpu().item())
+        loss_val = float(total_loss.detach().cpu().item())
         lid_loss_val = float(lid_ce_loss.detach().cpu().item())
         elapsed = time.time() - start_time
 
@@ -589,9 +600,7 @@ def main():
         if step % args.log_every == 0:
             if val_shard_files and step % args.val_every == 0:
                 val_loss = run_val(
-                    model.proj_in,
-                    model.backbone,
-                    model.proj_out,
+                    model,
                     val_shard_files=val_shard_files,
                     batch_size=args.batch_size,
                     mask_ratio=args.mask_ratio,
@@ -629,9 +638,8 @@ def main():
             f.write(json.dumps(asdict(log_entry)) + "\n")
 
         if step % args.ckpt_every == 0:
-            last_good_ckpt_path = save_checkpoint(args.save_dir, step, model, optimizer, cfg)
-
-    last_good_ckpt_path = save_checkpoint(args.save_dir, args.num_steps, model, optimizer, cfg)
+            last_good_ckpt_path = save_checkpoint(args.save_dir, step, model, optimizer, scaler, cfg)
+    last_good_ckpt_path = save_checkpoint(args.save_dir, args.num_steps, model, optimizer, scaler, cfg)
 
 
 if __name__ == "__main__":
