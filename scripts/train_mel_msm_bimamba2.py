@@ -460,7 +460,7 @@ def main():
         if torch.isnan(x_masked).any():
             print(f"WARNING: NaN detected in x_masked at step {step}; skipping batch.", flush=True)
             continue
-        hidden = model.backbone(model.input_norm(model.proj_in(x_masked)))
+        hidden = model.backbone(model.proj_in(x_masked))
         hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
         # VICReg: mean-pool hidden states for embedding regularization
         denom_v = pad_mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
