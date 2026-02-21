@@ -576,13 +576,13 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 continue
             hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
-            # VICReg — no L2 normalization, projector decouples backbone
+            # VICReg — applied directly to backbone embeddings, no projector
+            # Projector removed: single-view setup has no invariance term so projector
+            # fully decouples VICReg from backbone, allowing silent collapse
             denom_v  = pad_mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
             z_pooled = (hidden * pad_mask.unsqueeze(-1).to(hidden.dtype)).sum(dim=1) / denom_v
             z_pooled = z_pooled.clamp(-100.0, 100.0)
-            # NO L2 normalization — removed because it contradicts VICReg variance target
-            z_proj   = model.projector(z_pooled)                 # [B, 2048] unbounded
-            var_loss, cov_loss = vicreg_loss(z_proj)
+            var_loss, cov_loss = vicreg_loss(z_pooled)
             vicreg   = args.vicreg_var_weight * var_loss + args.vicreg_cov_weight * cov_loss
             # No invariance term — single-view setup has no second branch
             if torch.isnan(hidden).any():
