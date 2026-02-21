@@ -205,9 +205,18 @@ def apply_time_mask(x: torch.Tensor, pad_mask: torch.Tensor, mask_ratio: float, 
         li = int(pad_mask[i].sum().item())
         if li < 1:
             continue
-        k = max(1, int(mask_ratio * li))
-        idx = torch.randperm(li, generator=rng, device=x.device)[:k]
-        mask[i, idx] = True
+        num_to_mask = max(1, int(mask_ratio * li))
+        # Block masking: 3-5 contiguous spans
+        num_spans = random.randint(3, 5)
+        span_len = max(1, num_to_mask // num_spans)
+        masked = 0
+        attempts = 0
+        while masked < num_to_mask and attempts < 20:
+            attempts += 1
+            start = int(torch.randint(0, max(1, li - span_len), (1,), generator=rng).item())
+            end = min(li, start + span_len)
+            mask[i, start:end] = True
+            masked = int(mask[i].sum().item())
     valid_mask = mask & pad_mask
     x_masked = x.clone()
     x_masked[valid_mask] = 0.0
