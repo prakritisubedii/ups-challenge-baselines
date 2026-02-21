@@ -213,7 +213,7 @@ def apply_time_mask(x: torch.Tensor, pad_mask: torch.Tensor, mask_ratio: float, 
         attempts = 0
         while masked < num_to_mask and attempts < 20:
             attempts += 1
-            start = int(torch.randint(0, max(1, li - span_len), (1,), generator=rng).item())
+            start = int(torch.randint(0, max(1, li - span_len), (1,), generator=rng, device=x.device).item())
             end = min(li, start + span_len)
             mask[i, start:end] = True
             masked = int(mask[i].sum().item())
