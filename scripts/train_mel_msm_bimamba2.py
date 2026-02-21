@@ -117,7 +117,7 @@ class BiMambaMSM(torch.nn.Module):
         for layer, norm in zip(self.backbone, self.layer_norms):
             residual = x
             x = norm(x)
-            x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+            x = layer(x)
             x = x + residual.to(x.dtype)
         x = self.final_norm(x)
         hidden = x
