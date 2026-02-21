@@ -42,13 +42,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Masked spectrogram modeling with Bi-Mamba2 (from shards)")
     parser.add_argument("--precompute_dir", type=str, required=True)
     parser.add_argument("--save_dir", type=str, required=True)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--num_layers", type=int, default=6)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--warmup_steps", type=int, default=5000)
     parser.add_argument("--lr_decay", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--mask_ratio", type=float, default=0.30)
+    parser.add_argument("--mask_ratio", type=float, default=0.75)
     parser.add_argument("--num_steps", type=int, default=2000)
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--ckpt_every", type=int, default=1000)
@@ -66,7 +66,31 @@ def parse_args():
     parser.add_argument("--max_en_frac", type=float, default=0.1)
     parser.add_argument("--shuffle_shards", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shuffle_within_shard", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--labels_dir",         type=str,   default="./kmeans_labels",
+                        help="Directory with precomputed k-means label .pt files")
+    parser.add_argument("--num_clusters",        type=int,   default=200)
+    parser.add_argument("--vicreg_var_weight",   type=float, default=25.0)
+    parser.add_argument("--vicreg_cov_weight",   type=float, default=1.0)
     return parser.parse_args()
+
+
+class ProjectorMLP(nn.Module):
+    """Decouples backbone from VICReg loss. Protects backbone weights from
+    destructive orthogonalization. NO normalization on final output."""
+    def __init__(self, in_dim=256, hidden_dim=1024, out_dim=2048):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim, bias=False),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim, bias=False),
+            # NO normalization here — VICReg needs unbounded features
+        )
+    def forward(self, x):
+        return self.net(x)
 
 
 class BiMambaMSM(torch.nn.Module):
@@ -85,6 +109,8 @@ class BiMambaMSM(torch.nn.Module):
         self.input_norm = torch.nn.LayerNorm(d_model)
         self.proj_out = torch.nn.Linear(d_model, 80)
         self.lid_head = None
+        self.projector      = ProjectorMLP(in_dim=d_model, hidden_dim=1024, out_dim=2048)
+        self.mask_pred_head = nn.Linear(d_model, 200)
 
     def forward(self, x):
         x = self.proj_in(x)
@@ -253,6 +279,7 @@ class TrainLog:
     val_loss: Optional[float]
     elapsed_sec: float
     batch_lid_counts: dict
+    discrete_msm_loss: float = 0.0
 
 
 def compute_lr(step: int, num_steps: int, base_lr: float, warmup_steps: int, lr_decay: bool) -> float:
@@ -444,6 +471,23 @@ def main():
                 flush=True,
             )
     lid_keys = list(lid_index.keys()) if lid_index else []
+    # ── K-means labels cache ──────────────────────────────────────────
+    from pathlib import Path as _Path
+    labels_cache = {}  # shard_path -> {chunk_id: int16 ndarray [T]}
+    if os.path.isdir(args.labels_dir):
+        for shard_path in train_shard_files:
+            stem      = _Path(shard_path).stem
+            label_pt  = os.path.join(args.labels_dir, f"{stem}_labels.pt")
+            if os.path.exists(label_pt):
+                labels_cache[shard_path] = torch.load(
+                    label_pt, map_location="cpu", weights_only=False
+                )
+        print(f"Labels loaded for {len(labels_cache)}/{len(train_shard_files)}"
+              f" train shards", flush=True)
+    else:
+        print(f"WARNING: labels_dir {args.labels_dir} not found. "
+              f"Falling back to MSE loss.", flush=True)
+    # ─────────────────────────────────────────────────────────────────
 
     log_path = os.path.join(args.save_dir, "train_log.jsonl")
     start_time = time.time()
@@ -486,7 +530,29 @@ def main():
             continue
 
         x, pad_mask, _lengths, kept_samples = batch
+        # Build cluster_labels [B, T] aligned with x
+        # kept_samples[i] has 'chunk_id' and a shard reference via the stream
+        # We look up by chunk_id across all loaded label files
+        _B_now = len(kept_samples)
+        _T_now = x.shape[1]
+        cluster_labels = torch.zeros(_B_now, _T_now, dtype=torch.long)
+        for _i, _sample in enumerate(kept_samples):
+            if not isinstance(_sample, dict):
+                continue
+            _cid = _sample.get("chunk_id")
+            if _cid is None:
+                continue
+            # Search labels_cache for this chunk_id
+            for _shard_labels in labels_cache.values():
+                if _cid in _shard_labels:
+                    _lbl = _shard_labels[_cid]   # int16 ndarray [T_full]
+                    _len = min(len(_lbl), _T_now)
+                    cluster_labels[_i, :_len] = torch.tensor(
+                        _lbl[:_len].astype("int64")
+                    )
+                    break
         x = x.to(device, non_blocking=True)
+        cluster_labels = cluster_labels.to(device, non_blocking=True)
         pad_mask = pad_mask.to(device, non_blocking=True)
 
         x_masked, valid_mask = apply_time_mask(x, pad_mask, args.mask_ratio, rng)
@@ -510,15 +576,16 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 continue
             hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
-            # VICReg: mean-pool hidden states for embedding regularization
-            denom_v = pad_mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
+            # VICReg — no L2 normalization, projector decouples backbone
+            denom_v  = pad_mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
             z_pooled = (hidden * pad_mask.unsqueeze(-1).to(hidden.dtype)).sum(dim=1) / denom_v
             z_pooled = z_pooled.clamp(-100.0, 100.0)
-            z_norm = z_pooled.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-            z_vicreg = z_pooled / z_norm
-            var_loss, cov_loss = vicreg_loss(z_vicreg)
-            cov_loss = cov_loss.clamp(max=10.0)
-            vicreg = var_loss + 0.04 * cov_loss
+            # NO L2 normalization — removed because it contradicts VICReg variance target
+            z_proj   = model.projector(z_pooled)                 # [B, 2048] unbounded
+            var_loss, cov_loss = vicreg_loss(z_proj)
+            cov_loss = cov_loss.clamp(max=5.0)
+            vicreg   = args.vicreg_var_weight * var_loss + args.vicreg_cov_weight * cov_loss
+            # No invariance term — single-view setup has no second branch
             if torch.isnan(hidden).any():
                 kept_lids = [
                     str(sample.get("lid"))
@@ -539,8 +606,11 @@ def main():
                         pass
                     print("Restored from last good checkpoint", flush=True)
                 continue
-            pred = pred.clamp(-50.0, 50.0)
-            msm_loss = F.mse_loss(pred[valid_mask], x[valid_mask])
+            # Discrete MSM loss — cross-entropy over masked positions only
+            disc_logits  = model.mask_pred_head(hidden)          # [B, T, num_clusters]
+            disc_logits  = disc_logits[valid_mask]               # [N_masked, num_clusters]
+            disc_targets = cluster_labels[valid_mask]            # [N_masked]
+            msm_loss     = F.cross_entropy(disc_logits, disc_targets)
 
             lid_ce_loss = torch.tensor(0.0, device=device)
             if model.lid_head is not None and kept_samples:
@@ -565,7 +635,7 @@ def main():
                     target = torch.tensor(lid_targets, device=device, dtype=torch.long)
                     lid_ce_loss = F.cross_entropy(lid_logits.index_select(0, row_idx), target)
 
-            if not torch.isfinite(msm_loss) or msm_loss.item() > 200:
+            if not torch.isfinite(msm_loss) or msm_loss.item() > 50:
                 print(f"WARNING: loss spike ({msm_loss.item():.1f}) at step {step}; skipping.", flush=True)
                 if last_good_ckpt_path:
                     restore_ckpt = torch.load(last_good_ckpt_path, map_location=device)
@@ -612,6 +682,7 @@ def main():
 
         loss_val = float(total_loss.detach().cpu().item())
         lid_loss_val = float(lid_ce_loss.detach().cpu().item())
+        discrete_msm_loss_val = float(msm_loss.detach().cpu().item())
         elapsed = time.time() - start_time
 
         batch_lid_counts = Counter()
@@ -642,6 +713,7 @@ def main():
                 "val_loss": val_loss,
                 "elapsed_sec": elapsed,
                 "batch_lid_counts": dict(batch_lid_counts),
+                "discrete_msm_loss": discrete_msm_loss_val,
             }
             print(log_payload, flush=True)
         else:
@@ -655,6 +727,7 @@ def main():
             val_loss=val_loss,
             elapsed_sec=elapsed,
             batch_lid_counts=dict(batch_lid_counts),
+            discrete_msm_loss=discrete_msm_loss_val,
         )
         with open(log_path, "a") as f:
             f.write(json.dumps(asdict(log_entry)) + "\n")
