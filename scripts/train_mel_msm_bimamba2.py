@@ -583,7 +583,6 @@ def main():
             # NO L2 normalization — removed because it contradicts VICReg variance target
             z_proj   = model.projector(z_pooled)                 # [B, 2048] unbounded
             var_loss, cov_loss = vicreg_loss(z_proj)
-            cov_loss = cov_loss.clamp(max=5.0)
             vicreg   = args.vicreg_var_weight * var_loss + args.vicreg_cov_weight * cov_loss
             # No invariance term — single-view setup has no second branch
             if torch.isnan(hidden).any():
