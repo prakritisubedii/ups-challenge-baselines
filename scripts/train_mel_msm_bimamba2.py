@@ -487,6 +487,19 @@ def main():
             continue
         with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
             pred, hidden = model(x_masked)
+            if not torch.isfinite(pred).all() or not torch.isfinite(hidden).all():
+                print(f"WARNING: NaN/Inf in model output at step {step}; restoring checkpoint.", flush=True)
+                if last_good_ckpt_path:
+                    restore_ckpt = torch.load(last_good_ckpt_path, map_location=device)
+                    model.load_state_dict(restore_ckpt.get("model_state", {}), strict=False)
+                    optimizer.load_state_dict(restore_ckpt.get("optimizer_state", {}))
+                    try:
+                        scaler.load_state_dict(restore_ckpt["scaler_state"])
+                    except (ValueError, KeyError):
+                        pass
+                    print("Restored from last good checkpoint", flush=True)
+                optimizer.zero_grad(set_to_none=True)
+                continue
             hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
             # VICReg: mean-pool hidden states for embedding regularization
             denom_v = pad_mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
@@ -543,7 +556,7 @@ def main():
                     target = torch.tensor(lid_targets, device=device, dtype=torch.long)
                     lid_ce_loss = F.cross_entropy(lid_logits.index_select(0, row_idx), target)
 
-            if msm_loss.item() > 200:
+            if not torch.isfinite(msm_loss) or msm_loss.item() > 200:
                 print(f"WARNING: loss spike ({msm_loss.item():.1f}) at step {step}; skipping.", flush=True)
                 if last_good_ckpt_path:
                     restore_ckpt = torch.load(last_good_ckpt_path, map_location=device)
@@ -561,7 +574,7 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(total_loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
         scaler.step(optimizer)
         scaler.update()
         # Clamp SSM parameters to prevent selective scan overflow
