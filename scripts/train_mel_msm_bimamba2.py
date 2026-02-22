@@ -456,7 +456,7 @@ def main():
         shard_files=train_shard_files,
         shuffle=args.shuffle_shards,
         shuffle_within_shard=args.shuffle_within_shard,
-        seed=args.seed,
+        seed=args.seed + start_step,
     )
     sampling_rng = random.Random(args.seed + 7)
     lid_cache = ShardLRUCache(max_items=500)
