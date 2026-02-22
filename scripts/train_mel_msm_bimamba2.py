@@ -435,7 +435,7 @@ def main():
             optimizer.add_param_group({"params": model.lid_head.parameters(), "lr": args.lr * 20})
 
     if args.resume_from:
-        ckpt = torch.load(args.resume_from, map_location=device)
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
         model.load_state_dict(ckpt.get("model_state", {}), strict=False)
         try:
             optimizer.load_state_dict(ckpt.get("optimizer_state", {}))
